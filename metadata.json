@@ -1,0 +1,6 @@
+{
+  "name": "Tally XML Generator",
+  "description": "AI-powered tool to convert Excel accounting data into Tally-compatible XML format with automatic column mapping.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["firebase", "gemini"]
+}

@@ -1,0 +1,74 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.uid;
+    }
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "yogeshchajjed@gmail.com" && request.auth.token.email_verified == true));
+    }
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'email']) &&
+             data.uid == request.auth.uid &&
+             isValidEmail(data.email) &&
+             (!('role' in data) || data.role in ['admin', 'user']);
+    }
+
+    function isValidConversion(data) {
+      return data.keys().hasAll(['uid', 'fileName', 'status', 'timestamp']) &&
+             data.uid == request.auth.uid &&
+             data.status in ['pending', 'processing', 'completed', 'failed'] &&
+             (!('fileType' in data) || data.fileType in ['excel', 'pdf', 'csv', 'tally_xml']) &&
+             (!('voucherType' in data) || data.voucherType is string) &&
+             (!('bankLedger' in data) || data.bankLedger is string) &&
+             data.fileName is string && data.fileName.size() < 255;
+    }
+
+    function isValidTallyContext(data) {
+      return data.keys().hasAll(['uid', 'ledgers']) &&
+             data.uid == request.auth.uid &&
+             data.ledgers is list;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId) && isValidUser(request.resource.data) && (request.resource.data.role == 'user' || isAdmin());
+      allow update: if isOwner(userId) && isValidUser(request.resource.data) && (request.resource.data.role == resource.data.role || isAdmin());
+    }
+
+    match /conversions/{conversionId} {
+      allow read: if isDocOwner() || isAdmin();
+      allow create: if isAuthenticated() && request.resource.data.uid == request.auth.uid && isValidConversion(request.resource.data);
+      allow update: if isDocOwner() && isValidConversion(request.resource.data);
+      allow delete: if isDocOwner() || isAdmin();
+    }
+
+    match /tally_context/{userId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow create: if request.auth != null && request.auth.uid == userId && isValidTallyContext(request.resource.data);
+      allow update: if request.auth != null && request.auth.uid == userId && isValidTallyContext(request.resource.data);
+      allow delete: if request.auth != null && request.auth.uid == userId;
+    }
+  }
+}

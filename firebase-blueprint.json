@@ -1,0 +1,71 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "user"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email"]
+    },
+    "Conversion": {
+      "title": "Conversion",
+      "description": "A record of a data conversion task",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "User ID who performed the conversion" },
+        "fileName": { "type": "string" },
+        "fileType": { "type": "string", "enum": ["excel", "pdf", "csv", "tally_xml"] },
+        "voucherType": { "type": "string", "description": "Selected Tally voucher type" },
+        "bankLedger": { "type": "string", "description": "Selected Tally bank ledger" },
+        "status": { "type": "string", "enum": ["pending", "processing", "completed", "failed"] },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "xmlUrl": { "type": "string", "description": "Optional URL to the generated XML if stored" },
+        "error": { "type": "string" }
+      },
+      "required": ["uid", "fileName", "status", "timestamp"]
+    },
+    "TallyContext": {
+      "title": "TallyContext",
+      "description": "Stored Tally masters and daybook data for AI context",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "ledgers": { "type": "array", "items": { "type": "string" } },
+        "groups": { "type": "array", "items": { "type": "string" } },
+        "historicalMappings": { 
+          "type": "array", 
+          "items": { 
+            "type": "object",
+            "properties": {
+              "narration": { "type": "string" },
+              "ledger": { "type": "string" }
+            }
+          }
+        },
+        "lastUpdated": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "ledgers"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": "User",
+      "description": "User profiles"
+    },
+    "/conversions/{conversionId}": {
+      "schema": "Conversion",
+      "description": "Conversion history"
+    },
+    "/tally_context/{uid}": {
+      "schema": "TallyContext",
+      "description": "User's Tally masters context"
+    }
+  }
+}

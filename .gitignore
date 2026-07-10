@@ -1,0 +1,16 @@
+node_modules/
+dist/
+dist-electron/
+dist-installer/
+release/
+out/
+*.exe
+*.dmg
+*.AppImage
+*.blockmap
+*.zip
+*.7z
+*.tar.gz
+.DS_Store
+.env*
+!.env.example
