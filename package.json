@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "description": "Tally XML Generator Pro - AI-powered accounting tool",
   "author": "TallyGen Pro Team",
-  "main": "dist-electron/main.js",
+  "main": "dist-electron/main.cjs",
   "type": "module",
   "scripts": {
     "dev": "vite --port=3000 --host=0.0.0.0",
@@ -12,7 +12,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist dist-electron dist-installer",
     "lint": "tsc --noEmit",
-    "electron:build": "esbuild electron/main.ts --bundle --platform=node --format=esm --outfile=dist-electron/main.js && esbuild electron/preload.ts --bundle --platform=node --format=esm --outfile=dist-electron/preload.js",
+    "electron:build": "esbuild electron/main.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist-electron/main.cjs --external:electron --external:electron-updater --external:child_process --external:fs --external:path --external:os --external:crypto && esbuild electron/preload.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist-electron/preload.cjs --external:electron",
     "desktop:dist:win": "npm run build && npm run electron:build && electron-builder --win --x64 --publish never"
   },
   "dependencies": {

@@ -1,10 +1,5 @@
 import { app, BrowserWindow } from 'electron';
 import * as path from 'path';
-import { fileURLToPath } from 'url';
-
-// Resolve __dirname since we may bundle as CJS or ESM
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -14,7 +9,7 @@ function createWindow() {
     height: 800,
     title: 'TallyGen Pro',
     webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
+      preload: path.join(__dirname, 'preload.cjs'),
       nodeIntegration: false,
       contextIsolation: true,
     },
@@ -34,6 +29,18 @@ function createWindow() {
 
 app.whenReady().then(() => {
   createWindow();
+
+  // Safe check for auto-updater
+  try {
+    const { autoUpdater } = require('electron-updater');
+    if (autoUpdater) {
+      autoUpdater.checkForUpdatesAndNotify().catch((err: any) => {
+        console.warn('Auto updater check failed:', err);
+      });
+    }
+  } catch (error) {
+    console.warn('Auto updater unavailable:', error);
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
