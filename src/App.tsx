@@ -45,7 +45,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import * as XLSX from 'xlsx';
 import { XMLParser } from 'fast-xml-parser';
 import * as pdfjsLib from 'pdfjs-dist';
-import { getAIColumnMapping, ColumnMapping, mapBankTransactions, BankTransaction, MappedTransaction, parseBankStatementText } from './services/geminiService';
+import { getAIColumnMapping, ColumnMapping, mapBankTransactions, BankTransaction, MappedTransaction, parseBankStatementText, isGeminiAvailable } from './services/geminiService';
 import { 
   generateTallyXML, 
   generateLedgersXML, 
@@ -1532,7 +1532,18 @@ export default function App() {
 
       if (file.type === 'application/pdf') {
         const text = await extractTextFromPdf(file);
-        const transactions = await parseBankStatementText(text);
+        let transactions: BankTransaction[] = [];
+        if (isGeminiAvailable()) {
+          transactions = await parseBankStatementText(text);
+        } else {
+          const rawRows = parseBankStatementTextLocally(text);
+          transactions = rawRows.map(row => ({
+            date: row.date,
+            description: row.description,
+            amount: row.amount || 0,
+            reference: row.reference || ''
+          }));
+        }
         
         setPendingData(transactions);
         
@@ -3302,7 +3313,7 @@ export default function App() {
                   <div className="flex items-center justify-between mb-6">
                     <h2 className="text-xl font-bold flex items-center gap-2">
                       <Sparkles className="w-5 h-5 text-amber-500" />
-                      Step 2: AI Column Mapping
+                      {isGeminiAvailable() ? 'Step 2: AI Column Mapping' : 'Step 2: Local Deterministic Mapping'}
                     </h2>
                     <span className="text-sm text-zinc-500">{pendingFileName}</span>
                   </div>
@@ -3373,7 +3384,7 @@ export default function App() {
                     <div className="mt-12 space-y-4">
                       <h3 className="text-lg font-bold flex items-center gap-2">
                         <Sparkles className="w-5 h-5 text-amber-500" />
-                        Transaction-Level Ledger Suggestions
+                        {isGeminiAvailable() ? 'Transaction-Level Ledger Suggestions' : 'Local Deterministic Ledger Suggestions'}
                       </h3>
                       <div className="max-h-[400px] overflow-y-auto space-y-2 pr-2">
                         {aiMappedTransactions.map((tx, idx) => (

@@ -1,6 +1,17 @@
 import { GoogleGenAI, Type, ThinkingLevel } from "@google/genai";
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+let aiInstance: any = null;
+
+function getAI(): any {
+  if (!aiInstance) {
+    const key = typeof process !== 'undefined' && process.env ? process.env.GEMINI_API_KEY : '';
+    if (!key) {
+      throw new Error('An API Key must be set when running in a browser');
+    }
+    aiInstance = new GoogleGenAI({ apiKey: key });
+  }
+  return aiInstance;
+}
 
 export interface ColumnMapping {
   excelColumn: string;
@@ -9,7 +20,65 @@ export interface ColumnMapping {
   reasoning: string;
 }
 
+export function isElectron(): boolean {
+  return typeof window !== 'undefined' && (window as any).electron?.isElectron === true;
+}
+
+export function hasApiKey(): boolean {
+  return !!(typeof process !== 'undefined' && process.env && process.env.GEMINI_API_KEY);
+}
+
+export function isGeminiAvailable(): boolean {
+  if (isElectron()) return false;
+  return hasApiKey();
+}
+
+export function getLocalColumnMapping(headers: string[]): ColumnMapping[] {
+  const standardFields = {
+    DATE: ['date', 'txn date', 'transaction date', 'value date', 'posting date', 'txn_date'],
+    PARTYNAME: ['party name', 'partyname', 'particulars', 'ledger', 'ledger name', 'account'],
+    VOUCHERTYPENAME: ['voucher type', 'vouchertype', 'type', 'vch type', 'vouchertype name'],
+    VOUCHERNUMBER: ['voucher number', 'vouchernumber', 'vch no', 'voucher no', 'no', 'vch_no'],
+    AMOUNT: ['amount', 'transaction amount', 'credit', 'debit', 'value', 'total'],
+    NARRATION: ['narration', 'description', 'particulars', 'transaction details', 'details', 'remarks', 'narr'],
+    REFERENCE: ['reference', 'ref no', 'utr', 'cheque no', 'instrument no', 'transaction id', 'ref', 'chq no']
+  };
+
+  const mappings: ColumnMapping[] = [];
+
+  for (const [field, aliases] of Object.entries(standardFields)) {
+    // Try exact match first
+    let foundHeader = headers.find(h => {
+      const lower = h.toLowerCase().trim();
+      return aliases.some(alias => lower === alias);
+    });
+
+    // If not found, try partial match (includes or startsWith)
+    if (!foundHeader) {
+      foundHeader = headers.find(h => {
+        const lower = h.toLowerCase().trim();
+        return aliases.some(alias => lower.includes(alias) || alias.includes(lower));
+      });
+    }
+
+    if (foundHeader) {
+      mappings.push({
+        excelColumn: foundHeader,
+        tallyField: field,
+        confidence: 0.95,
+        reasoning: `Deterministic match for ${field} using local mapping engine.`
+      });
+    }
+  }
+
+  return mappings;
+}
+
 export async function getAIColumnMapping(headers: string[]): Promise<ColumnMapping[]> {
+  if (!isGeminiAvailable()) {
+    return getLocalColumnMapping(headers);
+  }
+
   const prompt = `
     Analyze the following Excel column headers and map them to standard Tally XML fields.
     Standard Tally fields include: DATE, PARTYNAME, VOUCHERTYPENAME, VOUCHERNUMBER, AMOUNT, NARRATION, REFERENCE.
@@ -27,7 +96,7 @@ export async function getAIColumnMapping(headers: string[]): Promise<ColumnMappi
     Return a JSON array of mappings.
   `;
 
-  const response = await ai.models.generateContent({
+  const response = await getAI().models.generateContent({
     model: "gemini-3.1-pro-preview",
     contents: prompt,
     config: {
@@ -70,6 +139,10 @@ export interface MappedTransaction extends BankTransaction {
 }
 
 export async function parseBankStatementText(text: string): Promise<BankTransaction[]> {
+  if (!isGeminiAvailable()) {
+    throw new Error("Gemini is not available. Please use local bank statement parser.");
+  }
+
   const prompt = `
     Extract bank transactions from the following text extracted from a PDF bank statement.
     Return a JSON array of objects with the following keys: date, description, amount.
@@ -79,7 +152,7 @@ export async function parseBankStatementText(text: string): Promise<BankTransact
     Text: ${text}
   `;
 
-  const response = await ai.models.generateContent({
+  const response = await getAI().models.generateContent({
     model: "gemini-3-flash-preview",
     contents: prompt,
     config: {
@@ -101,11 +174,49 @@ export async function parseBankStatementText(text: string): Promise<BankTransact
 
   return JSON.parse(response.text);
 }
+
 export async function mapBankTransactions(
   transactions: BankTransaction[],
   tallyLedgers: string[],
   historicalMappings?: { narration: string; ledger: string }[]
 ): Promise<MappedTransaction[]> {
+  if (!isGeminiAvailable()) {
+    return transactions.map(tx => {
+      const cleanNarr = tx.description.toLowerCase().trim();
+      let matchedLedger = '';
+
+      // 1. Exact historical
+      if (historicalMappings) {
+        const exact = historicalMappings.find(h => h.narration.toLowerCase().trim() === cleanNarr);
+        if (exact && tallyLedgers.includes(exact.ledger)) {
+          matchedLedger = exact.ledger;
+        }
+      }
+
+      // 2. Keyword match
+      if (!matchedLedger) {
+        for (const ledger of tallyLedgers) {
+          if (cleanNarr.includes(ledger.toLowerCase()) && ledger.length > 3) {
+            matchedLedger = ledger;
+            break;
+          }
+        }
+      }
+
+      // 3. Suspense fallback
+      if (!matchedLedger) {
+        matchedLedger = 'Suspense Account';
+      }
+
+      return {
+        ...tx,
+        tallyLedger: matchedLedger,
+        confidence: 0.9,
+        reasoning: `Mapped deterministically using Local Mapping Engine.`
+      };
+    });
+  }
+
   const prompt = `
     You are an expert Indian Accountant. Your task is to map bank statement transactions to the correct Tally Ledger.
     
@@ -128,7 +239,7 @@ export async function mapBankTransactions(
     Return a JSON array of mapped transactions.
   `;
 
-  const response = await ai.models.generateContent({
+  const response = await getAI().models.generateContent({
     model: "gemini-3.1-pro-preview",
     contents: prompt,
     config: {
