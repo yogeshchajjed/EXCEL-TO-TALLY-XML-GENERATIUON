@@ -21,6 +21,18 @@ import {
 } from 'firebase/firestore';
 import { auth, db, handleFirestoreError, OperationType } from './lib/firebase';
 import { 
+  getAppMode, 
+  isElectron, 
+  OFFLINE_USER, 
+  subscribeToConversions, 
+  subscribeToTallyContext, 
+  saveTallyContext, 
+  deleteTallyContext, 
+  saveConversion, 
+  updateConversion, 
+  clearOfflineWorkspace 
+} from './lib/storageAdapter';
+import { 
   FileSpreadsheet, 
   LogOut, 
   LogIn, 
@@ -61,7 +73,11 @@ import {
 } from './lib/tallyXml';
 
 // Set up PDF.js worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
+if (getAppMode() !== 'desktop-offline') {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
+} else {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = '';
+}
 
 // --- Types ---
 interface ConversionRecord {
@@ -536,6 +552,29 @@ export default function App() {
 
   // --- Auth ---
   useEffect(() => {
+    if (getAppMode() === 'desktop-offline') {
+      setUser({
+        uid: OFFLINE_USER.uid,
+        displayName: OFFLINE_USER.displayName,
+        email: OFFLINE_USER.email,
+        emailVerified: true,
+        isAnonymous: false,
+        metadata: {},
+        providerData: [],
+        tenantId: null,
+        delete: async () => {},
+        getIdToken: async () => '',
+        getIdTokenResult: async () => ({} as any),
+        reload: async () => {},
+        toJSON: () => ({}),
+        phoneNumber: null,
+        photoURL: null,
+        providerId: 'firebase',
+      } as unknown as User);
+      setLoading(false);
+      return;
+    }
+
     const unsubscribe = onAuthStateChanged(auth, (u) => {
       setUser(u);
       setLoading(false);
@@ -584,6 +623,12 @@ export default function App() {
 
     try {
       setIsProcessing(true);
+      if (getAppMode() === 'desktop-offline') {
+        await clearOfflineWorkspace(user.uid);
+        isResettingWorkspaceRef.current = false;
+        setError("Offline workspace cleared successfully.");
+        return;
+      }
       // Delete the active Tally context document from Firestore
       await deleteDoc(doc(db, 'tally_context', user.uid));
       isResettingWorkspaceRef.current = false;
@@ -636,41 +681,27 @@ export default function App() {
     }
 
     // Conversions
-    const q = query(
-      collection(db, 'conversions'),
-      where('uid', '==', user.uid)
-    );
-
-    const unsubscribeConversions = onSnapshot(q, (snapshot) => {
-      const docs = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      })) as ConversionRecord[];
-      setConversions(docs.sort((a, b) => (b.timestamp?.seconds || 0) - (a.timestamp?.seconds || 0)));
-    }, (err) => {
-      handleFirestoreError(err, OperationType.LIST, 'conversions');
+    const unsubscribeConversions = subscribeToConversions(user.uid, (docs) => {
+      setConversions(docs as ConversionRecord[]);
     });
 
     // Tally Context
-    const unsubscribeContext = onSnapshot(doc(db, 'tally_context', user.uid), (snapshot) => {
+    const unsubscribeContext = subscribeToTallyContext(user.uid, (data) => {
       if (isResettingWorkspaceRef.current) {
-        if (!snapshot.exists()) {
+        if (!data) {
           setTallyContext(null);
           setProceededWithContext(false);
           isResettingWorkspaceRef.current = false;
-        } else {
-          const data = snapshot.data();
-          if (!data || !data.ledgers || data.ledgers.length === 0) {
-            setTallyContext(data as TallyContext);
-            setProceededWithContext(false);
-            isResettingWorkspaceRef.current = false;
-          }
+        } else if (!data.ledgers || data.ledgers.length === 0) {
+          setTallyContext(data as TallyContext);
+          setProceededWithContext(false);
+          isResettingWorkspaceRef.current = false;
         }
         return;
       }
 
-      if (snapshot.exists()) {
-        setTallyContext(snapshot.data() as TallyContext);
+      if (data) {
+        setTallyContext(data as TallyContext);
         setProceededWithContext(true);
       } else {
         setTallyContext(null);
@@ -801,7 +832,7 @@ export default function App() {
 
         const existingMappings = tallyContext?.historicalMappings || [];
 
-        await setDoc(doc(db, 'tally_context', user.uid), {
+        const contextPayload: any = {
           uid: user.uid,
           ledgers: Array.from(new Set(parsed.ledgers)),
           groups: Array.from(new Set(parsed.groups)),
@@ -811,9 +842,12 @@ export default function App() {
           ledgerGroupMap: parsed.ledgerGroupMap,
           stockItemStockGroupMap: parsed.stockItemStockGroupMap,
           groupParentMap: parsed.groupParentMap || {},
-          historicalMappings: existingMappings,
-          lastUpdated: serverTimestamp()
-        });
+          historicalMappings: existingMappings
+        };
+        if (getAppMode() === 'web') {
+          contextPayload.lastUpdated = serverTimestamp();
+        }
+        await saveTallyContext(user.uid, contextPayload);
 
         setIsContextLoading(false);
       } catch (err) {
@@ -891,7 +925,7 @@ export default function App() {
         
         const mergedHistorical = [...currentHistorical, ...historicalMappings].slice(0, 500);
 
-        await setDoc(doc(db, 'tally_context', user.uid), {
+        const contextPayload: any = {
           uid: user.uid,
           ledgers: mergedLedgers,
           groups: currentGroups,
@@ -901,9 +935,12 @@ export default function App() {
           ledgerGroupMap: currentLedgerGroupMap,
           stockItemStockGroupMap: currentStockItemStockGroupMap,
           groupParentMap: currentGroupParentMap,
-          historicalMappings: mergedHistorical,
-          lastUpdated: serverTimestamp()
-        });
+          historicalMappings: mergedHistorical
+        };
+        if (getAppMode() === 'web') {
+          contextPayload.lastUpdated = serverTimestamp();
+        }
+        await saveTallyContext(user.uid, contextPayload);
 
         setIsContextLoading(false);
       } catch (err) {
@@ -999,7 +1036,7 @@ export default function App() {
 
     await Promise.all(Array.from(files).map(processFile));
 
-    await setDoc(doc(db, 'tally_context', user.uid), {
+    const contextPayload: any = {
       uid: user.uid,
       ledgers: Array.from(new Set(ledgers)),
       groups: Array.from(new Set(groups)),
@@ -1009,9 +1046,12 @@ export default function App() {
       ledgerGroupMap,
       stockItemStockGroupMap,
       groupParentMap,
-      historicalMappings: historicalMappings.slice(0, 500),
-      lastUpdated: serverTimestamp()
-    });
+      historicalMappings: historicalMappings.slice(0, 500)
+    };
+    if (getAppMode() === 'web') {
+      contextPayload.lastUpdated = serverTimestamp();
+    }
+    await saveTallyContext(user.uid, contextPayload);
 
     setIsContextLoading(false);
   };
@@ -1338,14 +1378,16 @@ export default function App() {
         throw new Error(`Row ${missingLedgerRow.rowNo} has no Particulars Ledger selected. Please select a ledger.`);
       }
 
-      const conversionRef = await addDoc(collection(db, 'conversions'), {
-        uid: user?.uid,
+      const conversionPayload: any = {
         fileName: pendingFileName,
-        timestamp: serverTimestamp(),
         voucherType: 'Voucher',
         status: 'processing',
         bankLedger: selectedBankLedger
-      });
+      };
+      if (getAppMode() === 'web') {
+        conversionPayload.timestamp = serverTimestamp();
+      }
+      const conversionId = await saveConversion(user?.uid || OFFLINE_USER.uid, conversionPayload);
 
       const vouchers: TallyVoucher[] = validRows.map(row => {
         const dateNorm = normalizeTallyDate(row.date);
@@ -1383,13 +1425,13 @@ export default function App() {
       });
 
       const xml = generateTallyXML(vouchers);
-      await updateDoc(doc(db, 'conversions', conversionRef.id), {
+      await updateConversion(user?.uid || OFFLINE_USER.uid, conversionId, {
         status: 'completed',
         xmlContent: xml
       });
 
       const newRecord: ConversionRecord = {
-        id: conversionRef.id,
+        id: conversionId,
         fileName: pendingFileName,
         timestamp: { seconds: Math.floor(Date.now() / 1000) },
         status: 'completed',
@@ -1409,6 +1451,11 @@ export default function App() {
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !user) return;
+
+    if (file.type === 'application/pdf' && getAppMode() === 'desktop-offline') {
+      setError("PDF parsing is not available offline yet. Please upload Excel/CSV bank statement.");
+      return;
+    }
 
     if (importType !== 'Voucher') {
       await handleMasterFileUpload(file);
@@ -2172,14 +2219,16 @@ export default function App() {
         defaultFileName = 'tally-units.xml';
       }
 
-      await addDoc(collection(db, 'conversions'), {
-        uid: user.uid,
+      const conversionPayload: any = {
         fileName: pendingFileName || defaultFileName,
         status: 'completed',
-        timestamp: serverTimestamp(),
         voucherType: importType,
         xmlContent: xmlContent
-      });
+      };
+      if (getAppMode() === 'web') {
+        conversionPayload.timestamp = serverTimestamp();
+      }
+      await saveConversion(user.uid, conversionPayload);
 
       downloadXML(xmlContent, defaultFileName);
       setCurrentStep('complete');
@@ -2196,14 +2245,16 @@ export default function App() {
     setError(null);
 
     try {
-      const conversionRef = await addDoc(collection(db, 'conversions'), {
-        uid: user.uid,
+      const conversionPayload: any = {
         fileName: pendingFileName,
         status: 'processing',
-        timestamp: serverTimestamp(),
         voucherType: selectedVoucherType,
         bankLedger: selectedBankLedger
-      });
+      };
+      if (getAppMode() === 'web') {
+        conversionPayload.timestamp = serverTimestamp();
+      }
+      const conversionId = await saveConversion(user.uid, conversionPayload);
 
       const vouchers: TallyVoucher[] = pendingData.map((row: any, rowIndex: number) => {
         let dateVal: any = undefined;
@@ -2290,7 +2341,7 @@ export default function App() {
       });
 
       const xml = generateTallyXML(vouchers);
-      await updateDoc(doc(db, 'conversions', conversionRef.id), {
+      await updateConversion(user.uid, conversionId, {
         status: 'completed',
         xmlContent: xml
       });
@@ -2415,7 +2466,16 @@ export default function App() {
             <div className="w-8 h-8 bg-zinc-900 rounded-lg flex items-center justify-center">
               <FileSpreadsheet className="w-5 h-5 text-white" />
             </div>
-            <span className="font-bold text-lg hidden sm:block">TallyGen Pro</span>
+            <div className="flex flex-col">
+              <span className="font-bold text-lg leading-none">TallyGen Pro</span>
+              <span className="text-[10px] text-zinc-400 font-normal">v1.0.0</span>
+            </div>
+            {getAppMode() === 'desktop-offline' && (
+              <span className="bg-amber-100 text-amber-800 text-xs font-semibold px-2.5 py-0.5 rounded border border-amber-200 flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse"></span>
+                Desktop Offline
+              </span>
+            )}
           </div>
 
           <div className="flex items-center gap-4">
@@ -2440,16 +2500,24 @@ export default function App() {
             </button>
 
             <div className="flex items-center gap-2 px-3 py-1.5 bg-zinc-100 rounded-full">
-              <img src={user.photoURL || ''} alt="" className="w-6 h-6 rounded-full" referrerPolicy="no-referrer" />
+              {user.photoURL ? (
+                <img src={user.photoURL} alt="" className="w-6 h-6 rounded-full" referrerPolicy="no-referrer" />
+              ) : (
+                <div className="w-6 h-6 rounded-full bg-zinc-800 text-white flex items-center justify-center text-[10px] font-bold">
+                  {user.displayName?.charAt(0).toUpperCase() || 'U'}
+                </div>
+              )}
               <span className="text-sm font-medium hidden md:block">{user.displayName}</span>
             </div>
-            <button 
-              onClick={handleLogout}
-              className="p-2 hover:bg-zinc-100 rounded-full transition-colors text-zinc-500"
-              title="Logout"
-            >
-              <LogOut className="w-5 h-5" />
-            </button>
+            {getAppMode() !== 'desktop-offline' && (
+              <button 
+                onClick={handleLogout}
+                className="p-2 hover:bg-zinc-100 rounded-full transition-colors text-zinc-500"
+                title="Logout"
+              >
+                <LogOut className="w-5 h-5" />
+              </button>
+            )}
           </div>
         </div>
       </header>
@@ -4281,7 +4349,16 @@ export default function App() {
                         <div className="min-w-0">
                           <p className="text-sm font-medium truncate max-w-[120px]">{conv.fileName}</p>
                           <p className="text-xs text-zinc-500">
-                            {conv.timestamp?.toDate().toLocaleDateString()}
+                            {(() => {
+                              if (!conv.timestamp) return '';
+                              if (typeof conv.timestamp.toDate === 'function') {
+                                return conv.timestamp.toDate().toLocaleDateString();
+                              }
+                              if (conv.timestamp.seconds) {
+                                return new Date(conv.timestamp.seconds * 1000).toLocaleDateString();
+                              }
+                              return new Date(conv.timestamp).toLocaleDateString();
+                            })()}
                           </p>
                         </div>
                       </div>

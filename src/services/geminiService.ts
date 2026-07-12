@@ -203,9 +203,14 @@ export async function mapBankTransactions(
         }
       }
 
-      // 3. Suspense fallback
+      // 3. No fallback to Suspense Account if no match found
       if (!matchedLedger) {
-        matchedLedger = 'Suspense Account';
+        return {
+          ...tx,
+          tallyLedger: '',
+          confidence: 0,
+          reasoning: 'No reliable local match. User review required.'
+        };
       }
 
       return {
