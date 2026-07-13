@@ -264,7 +264,7 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [mappings, setMappings] = useState<ColumnMapping[]>([]);
-  const [currentStep, setCurrentStep] = useState<'upload' | 'mapping' | 'complete' | 'context' | 'master-review' | 'bank-statement-review'>('upload');
+  const [currentStep, setCurrentStep] = useState<'upload' | 'mapping' | 'complete' | 'context' | 'master-review' | 'bank-statement-review' | 'bank-statement-detection-review'>('upload');
   const [pendingData, setPendingData] = useState<any[]>([]);
   const [pendingFileName, setPendingFileName] = useState('');
   const [tallyContext, setTallyContext] = useState<TallyContext | null>(null);
@@ -292,6 +292,32 @@ export default function App() {
   const [voucherImportMethod, setVoucherImportMethod] = useState<'template' | 'bankStatement'>('template');
   const [voucherMode, setVoucherMode] = useState<'auto' | 'payment' | 'receipt'>('auto');
   const [bankStatementRows, setBankStatementRows] = useState<any[]>([]);
+
+  // Advanced Bank Statement States
+  const [rawGrid, setRawGrid] = useState<any[][]>([]);
+  const [columnMappings, setColumnMappings] = useState<{
+    date: number | null;
+    narration: number | null;
+    debit: number | null;
+    credit: number | null;
+    amount: number | null;
+    drCr: number | null;
+    balance: number | null;
+    reference: number | null;
+  }>({
+    date: null,
+    narration: null,
+    debit: null,
+    credit: null,
+    amount: null,
+    drCr: null,
+    balance: null,
+    reference: null,
+  });
+  const [headerRowIdx, setHeaderRowIdx] = useState<number>(0);
+  const [dataStartRowIdx, setDataStartRowIdx] = useState<number>(1);
+  const [dataEndRowIdx, setDataEndRowIdx] = useState<number>(0);
+  const [detectedVoucherMode, setDetectedVoucherMode] = useState<'auto' | 'payment' | 'receipt'>('auto');
 
   // Field Aliases for deterministic mapping
   const LEDGER_FIELDS = {
@@ -1078,28 +1104,59 @@ export default function App() {
   };
 
   // --- Local Deterministic Bank Statement Helpers ---
-  const suggestLedgerForNarration = (narration: string, context: TallyContext | null): string => {
-    if (!context || !narration) return '';
+  const suggestLedgerForNarrationEnhanced = (
+    narration: string,
+    context: TallyContext | null
+  ): { ledgerName: string; confidence: number; reasoning: string } => {
+    if (!context || !narration) {
+      return { ledgerName: '', confidence: 0, reasoning: 'No narration or context' };
+    }
+
     const cleanNarr = narration.toLowerCase().trim();
-    
-    // 1. Exact old narration mapping from historicalMappings
+    const normNarr = cleanNarr.replace(/[^a-z0-9]/g, '');
+
+    const isValidLedger = (name: string) => context.ledgers.includes(name);
+
+    let candidateLedger = '';
+    let candidateConfidence = 0;
+    let candidateReasoning = 'No match found.';
+
+    // 1. Exact historical mapping from Daybook
     if (context.historicalMappings) {
       const exactHist = context.historicalMappings.find(h => h.narration.toLowerCase().trim() === cleanNarr);
-      if (exactHist && context.ledgers.includes(exactHist.ledger)) {
-        return exactHist.ledger;
+      if (exactHist && isValidLedger(exactHist.ledger)) {
+        candidateLedger = exactHist.ledger;
+        candidateConfidence = 1.0;
+        candidateReasoning = 'Matched exact historical narration from Daybook';
       }
     }
 
-    // 2. Keyword matching against ledger names
-    for (const ledger of context.ledgers) {
-      const ledgerLower = ledger.toLowerCase();
-      if (cleanNarr.includes(ledgerLower) && ledgerLower.length > 3) {
-        return ledger;
+    // 2. Normalized historical match
+    if (!candidateLedger && context.historicalMappings) {
+      const normHist = context.historicalMappings.find(h => h.narration.toLowerCase().replace(/[^a-z0-9]/g, '') === normNarr);
+      if (normHist && isValidLedger(normHist.ledger)) {
+        candidateLedger = normHist.ledger;
+        candidateConfidence = 0.95;
+        candidateReasoning = 'Matched normalized historical narration';
       }
     }
 
-    // 3. Similar narration mapping from historicalMappings
-    if (context.historicalMappings) {
+    // 3. Keyword match (exact ledger name in narration)
+    if (!candidateLedger) {
+      const sortedLedgers = [...context.ledgers].sort((a, b) => b.length - a.length);
+      for (const ledger of sortedLedgers) {
+        const ledgerLower = ledger.toLowerCase().trim();
+        if (ledgerLower.length > 3 && cleanNarr.includes(ledgerLower)) {
+          candidateLedger = ledger;
+          candidateConfidence = 0.90;
+          candidateReasoning = `Found exact ledger name "${ledger}" in narration`;
+          break;
+        }
+      }
+    }
+
+    // 4. Fuzzy match (getSimilarity score >= 0.8)
+    if (!candidateLedger && context.historicalMappings) {
       let bestMatch: { ledger: string; score: number } | null = null;
       for (const h of context.historicalMappings) {
         const score = getSimilarity(h.narration, narration);
@@ -1109,20 +1166,237 @@ export default function App() {
           }
         }
       }
-      if (bestMatch && context.ledgers.includes(bestMatch.ledger)) {
-        return bestMatch.ledger;
+      if (bestMatch && isValidLedger(bestMatch.ledger)) {
+        candidateLedger = bestMatch.ledger;
+        candidateConfidence = Math.round(bestMatch.score * 100) / 100;
+        candidateReasoning = `Fuzzy matched historical narration with ${(bestMatch.score * 100).toFixed(0)}% similarity`;
       }
     }
 
-    // 4. Fallback: Keyword matches of individual ledger name words
-    for (const ledger of context.ledgers) {
-      const ledgerWords = ledger.toLowerCase().split(/[^a-zA-Z0-9]/).filter(w => w.length > 3);
-      if (ledgerWords.length > 0 && ledgerWords.every(w => cleanNarr.includes(w))) {
-        return ledger;
+    // 5. Ledger name words found inside narration
+    if (!candidateLedger) {
+      const sortedLedgers = [...context.ledgers].sort((a, b) => b.length - a.length);
+      for (const ledger of sortedLedgers) {
+        const ledgerWords = ledger.toLowerCase().split(/[^a-zA-Z0-9]/).filter(w => w.length > 3);
+        if (ledgerWords.length > 0 && ledgerWords.every(w => cleanNarr.includes(w))) {
+          candidateLedger = ledger;
+          candidateConfidence = 0.75;
+          candidateReasoning = `All descriptive words of "${ledger}" found in narration`;
+          break;
+        }
       }
     }
 
-    return '';
+    const hasSuspense = isValidLedger('Suspense Account');
+
+    // Rule: Where system is less than 90% sure about ledger name, select Suspense Account (if available).
+    if (candidateLedger && candidateConfidence >= 0.90) {
+      return {
+        ledgerName: candidateLedger,
+        confidence: candidateConfidence,
+        reasoning: candidateReasoning
+      };
+    } else {
+      if (hasSuspense) {
+        return {
+          ledgerName: 'Suspense Account',
+          confidence: candidateLedger ? candidateConfidence : 0,
+          reasoning: candidateLedger 
+            ? `Match found ("${candidateLedger}" with ${(candidateConfidence*100).toFixed(0)}% confidence) is below 90% threshold. Fallback to Suspense.`
+            : 'No reliable local match. Fallback to Suspense.'
+        };
+      } else {
+        return {
+          ledgerName: '',
+          confidence: candidateLedger ? candidateConfidence : 0,
+          reasoning: candidateLedger
+            ? `Match found ("${candidateLedger}" with ${(candidateConfidence*100).toFixed(0)}% confidence) is below 90% threshold. "Suspense Account" not found.`
+            : 'No reliable local match. "Suspense Account" not found.'
+        };
+      }
+    }
+  };
+
+  const suggestLedgerForNarration = (narration: string, context: TallyContext | null): string => {
+    return suggestLedgerForNarrationEnhanced(narration, context).ledgerName;
+  };
+
+  const autoDetectBankStatement = (rows: any[][]) => {
+    const DATE_ALIASES = ['date', 'txn date', 'transaction date', 'value date', 'posting date', 'entry date'];
+    const NARRATION_ALIASES = ['narration', 'description', 'particulars', 'transaction details', 'details', 'remarks', 'description/narration'];
+    const DEBIT_ALIASES = ['debit', 'withdrawal', 'withdrawals', 'paid out', 'dr', 'debit amount', 'withdrawal amount', 'payment', 'payment amount'];
+    const CREDIT_ALIASES = ['credit', 'deposit', 'deposits', 'paid in', 'cr', 'credit amount', 'deposit amount', 'receipt', 'receipt amount'];
+    const AMOUNT_ALIASES = ['amount', 'transaction amount', 'txn amount', 'value', 'amt'];
+    const DR_CR_ALIASES = ['dr/cr', 'debit/credit', 'cr/dr', 'type', 'transaction type', 'amount type', 'd/c'];
+    const BALANCE_ALIASES = ['balance', 'closing balance', 'running balance', 'available balance', 'ledger balance'];
+    const REFERENCE_ALIASES = ['reference', 'ref no', 'utr', 'cheque no', 'instrument no', 'transaction id', 'txn id', 'bank ref', 'chq/ref no'];
+
+    let bestHeaderRowIdx = 0;
+    let maxScore = -1;
+
+    const scanLimit = Math.min(50, rows.length);
+    for (let r = 0; r < scanLimit; r++) {
+      const row = rows[r];
+      if (!row || row.length === 0) continue;
+
+      let score = 0;
+      let hasDateLike = false;
+      let hasNarrLike = false;
+      let hasDebitCreditOrAmt = false;
+      let hasBalance = false;
+      let hasRef = false;
+
+      row.forEach(val => {
+        if (val === undefined || val === null) return;
+        const str = String(val).toLowerCase().trim();
+        if (!str) return;
+
+        if (DATE_ALIASES.includes(str)) {
+          score += 10;
+          hasDateLike = true;
+        } else if (NARRATION_ALIASES.includes(str)) {
+          score += 10;
+          hasNarrLike = true;
+        } else if (DEBIT_ALIASES.includes(str) || CREDIT_ALIASES.includes(str) || AMOUNT_ALIASES.includes(str)) {
+          score += 10;
+          hasDebitCreditOrAmt = true;
+        } else if (BALANCE_ALIASES.includes(str)) {
+          score += 5;
+          hasBalance = true;
+        } else if (REFERENCE_ALIASES.includes(str)) {
+          score += 5;
+          hasRef = true;
+        } else if (DR_CR_ALIASES.includes(str)) {
+          score += 5;
+        }
+      });
+
+      // Special literal checks
+      if (hasDateLike && hasNarrLike && (hasDebitCreditOrAmt || hasBalance)) {
+        score += 50;
+      }
+
+      if (score > maxScore) {
+        maxScore = score;
+        bestHeaderRowIdx = r;
+      }
+    }
+
+    const headerRow = rows[bestHeaderRowIdx] || [];
+    const mappings = {
+      date: null as number | null,
+      narration: null as number | null,
+      debit: null as number | null,
+      credit: null as number | null,
+      amount: null as number | null,
+      drCr: null as number | null,
+      balance: null as number | null,
+      reference: null as number | null,
+    };
+
+    headerRow.forEach((val, c) => {
+      if (val === undefined || val === null) return;
+      const str = String(val).toLowerCase().trim();
+      if (!str) return;
+
+      if (DATE_ALIASES.includes(str) && mappings.date === null) {
+        mappings.date = c;
+      } else if (NARRATION_ALIASES.includes(str) && mappings.narration === null) {
+        mappings.narration = c;
+      } else if (DEBIT_ALIASES.includes(str) && mappings.debit === null) {
+        mappings.debit = c;
+      } else if (CREDIT_ALIASES.includes(str) && mappings.credit === null) {
+        mappings.credit = c;
+      } else if (AMOUNT_ALIASES.includes(str) && mappings.amount === null) {
+        mappings.amount = c;
+      } else if (DR_CR_ALIASES.includes(str) && mappings.drCr === null) {
+        mappings.drCr = c;
+      } else if (BALANCE_ALIASES.includes(str) && mappings.balance === null) {
+        mappings.balance = c;
+      } else if (REFERENCE_ALIASES.includes(str) && mappings.reference === null) {
+        mappings.reference = c;
+      }
+    });
+
+    headerRow.forEach((val, c) => {
+      if (val === undefined || val === null) return;
+      const str = String(val).toLowerCase().trim();
+      if (!str) return;
+
+      if (mappings.date === null && str.includes('date')) {
+        mappings.date = c;
+      } else if (mappings.narration === null && (str.includes('narr') || str.includes('desc') || str.includes('part') || str.includes('detail') || str.includes('remark'))) {
+        mappings.narration = c;
+      } else if (mappings.debit === null && (str.includes('debit') || str.includes('withdr') || str.includes('paid out'))) {
+        mappings.debit = c;
+      } else if (mappings.credit === null && (str.includes('credit') || str.includes('deposit') || str.includes('paid in'))) {
+        mappings.credit = c;
+      } else if (mappings.amount === null && str.includes('amount') && !str.includes('balance')) {
+        mappings.amount = c;
+      } else if (mappings.reference === null && (str.includes('ref') || str.includes('utr') || str.includes('cheque') || str.includes('chq') || str.includes('instrument') || str.includes('txn id') || str.includes('transaction id'))) {
+        mappings.reference = c;
+      } else if (mappings.drCr === null && (str.includes('dr/cr') || str.includes('d/c') || str.includes('type'))) {
+        mappings.drCr = c;
+      } else if (mappings.balance === null && str.includes('balance')) {
+        mappings.balance = c;
+      }
+    });
+
+    let dataStartRowIdx = bestHeaderRowIdx + 1;
+    while (dataStartRowIdx < rows.length) {
+      const row = rows[dataStartRowIdx];
+      const isRowBlank = !row || row.every(val => val === undefined || val === null || String(val).trim() === '');
+      if (!isRowBlank) {
+        break;
+      }
+      dataStartRowIdx++;
+    }
+
+    let dataEndRowIdx = rows.length - 1;
+    const summaryKeywords = [
+      'opening balance', 'closing balance', 'total', 'grand total', 'statement summary',
+      'page total', 'carried forward', 'brought forward', 'opening bal', 'closing bal'
+    ];
+
+    for (let r = dataStartRowIdx; r < rows.length; r++) {
+      const row = rows[r];
+      if (!row) continue;
+
+      let isSummaryRow = false;
+      for (const val of row) {
+        if (val === undefined || val === null) continue;
+        const strVal = String(val).toLowerCase().trim();
+        if (summaryKeywords.some(kw => strVal === kw || strVal.startsWith(kw) || strVal.includes(' ' + kw) || strVal.includes(kw + ' '))) {
+          isSummaryRow = true;
+          break;
+        }
+      }
+
+      if (isSummaryRow) {
+        dataEndRowIdx = r - 1;
+        break;
+      }
+    }
+
+    if (dataEndRowIdx < dataStartRowIdx) {
+      dataEndRowIdx = rows.length - 1;
+    }
+
+    while (dataEndRowIdx >= dataStartRowIdx) {
+      const row = rows[dataEndRowIdx];
+      const isRowBlank = !row || row.every(val => val === undefined || val === null || String(val).trim() === '');
+      if (!isRowBlank) {
+        break;
+      }
+      dataEndRowIdx--;
+    }
+
+    return {
+      headerRowIdx: bestHeaderRowIdx,
+      dataStartRowIdx,
+      dataEndRowIdx,
+      mappings
+    };
   };
 
   const parseBankStatementTextLocally = (text: string): any[] => {
@@ -1447,6 +1721,230 @@ export default function App() {
     }
   };
 
+  const applyDetectionAndMapLedgers = () => {
+    setIsProcessing(true);
+    setError(null);
+
+    try {
+      const results: any[] = [];
+      
+      const dCol = columnMappings.date;
+      const nCol = columnMappings.narration;
+      const dbCol = columnMappings.debit;
+      const crCol = columnMappings.credit;
+      const aCol = columnMappings.amount;
+      const dcCol = columnMappings.drCr;
+      const rCol = columnMappings.reference;
+      
+      // Check that we have at least Date and Narration columns mapped!
+      if (dCol === null) throw new Error("Please select Date column mapping.");
+      if (nCol === null) throw new Error("Please select Narration column mapping.");
+      
+      // Loop from dataStartRowIdx to dataEndRowIdx
+      const startIdx = Math.max(0, dataStartRowIdx);
+      const endIdx = Math.min(rawGrid.length - 1, dataEndRowIdx);
+      
+      // Check if Suspense Account is available
+      const hasSuspense = tallyContext?.ledgers.includes('Suspense Account') || false;
+
+      for (let r = startIdx; r <= endIdx; r++) {
+        const row = rawGrid[r];
+        if (!row) continue;
+        
+        // If the row is completely empty, skip it
+        const isRowBlank = row.every(val => val === undefined || val === null || String(val).trim() === '');
+        if (isRowBlank) continue;
+        
+        // Date value parsing
+        let dateVal = row[dCol];
+        let dateStr = '';
+        if (dateVal instanceof Date) {
+          const d = dateVal.getDate();
+          const m = dateVal.getMonth() + 1;
+          const y = dateVal.getFullYear();
+          dateStr = `${String(d).padStart(2, '0')}/${String(m).padStart(2, '0')}/${y}`;
+        } else if (typeof dateVal === 'number' && dateVal > 40000 && dateVal < 100000) {
+          const date = new Date((dateVal - 25569) * 86400 * 1000);
+          const d = date.getDate();
+          const m = date.getMonth() + 1;
+          const y = date.getFullYear();
+          dateStr = `${String(d).padStart(2, '0')}/${String(m).padStart(2, '0')}/${y}`;
+        } else if (dateVal !== undefined && dateVal !== null) {
+          dateStr = String(dateVal).trim();
+        }
+        
+        // Narration
+        let descVal = row[nCol];
+        let description = descVal !== undefined && descVal !== null ? String(descVal).trim() : 'No Narration Found';
+        
+        // Debit & Credit
+        let debitVal = dbCol !== null ? row[dbCol] : undefined;
+        let creditVal = crCol !== null ? row[crCol] : undefined;
+        let debitNum: number | null = null;
+        let creditNum: number | null = null;
+        
+        if (debitVal !== undefined && debitVal !== null && String(debitVal).trim() !== '') {
+          const parsed = parseFloat(String(debitVal).replace(/,/g, ''));
+          if (!isNaN(parsed) && parsed > 0) debitNum = parsed;
+        }
+        if (creditVal !== undefined && creditVal !== null && String(creditVal).trim() !== '') {
+          const parsed = parseFloat(String(creditVal).replace(/,/g, ''));
+          if (!isNaN(parsed) && parsed > 0) creditNum = parsed;
+        }
+        
+        // Single Amount
+        let amountNum = 0;
+        if (aCol !== null && row[aCol] !== undefined && row[aCol] !== null && String(row[aCol]).trim() !== '') {
+          const parsed = parseFloat(String(row[aCol]).replace(/,/g, ''));
+          if (!isNaN(parsed)) amountNum = parsed;
+        }
+        
+        // Dr/Cr Indicator
+        let dcVal = dcCol !== null ? row[dcCol] : undefined;
+        let drCrStr = '';
+        if (dcVal !== undefined && dcVal !== null) {
+          const str = String(dcVal).toLowerCase().trim();
+          if (['dr', 'debit'].includes(str)) {
+            drCrStr = 'Dr';
+          } else if (['cr', 'credit'].includes(str)) {
+            drCrStr = 'Cr';
+          } else if (str) {
+            drCrStr = str;
+          }
+        }
+        
+        // Reference
+        let refVal = rCol !== null ? row[rCol] : undefined;
+        let reference = refVal !== undefined && refVal !== null ? String(refVal).trim() : '';
+        
+        // Classify transaction row-wise
+        let detectedVoucherType: 'Payment' | 'Receipt' | 'Unknown' = 'Unknown';
+        let status: 'valid' | 'invalid' | 'warning' = 'valid';
+        let errorMsg = '';
+        let finalAmount = 0;
+        
+        // If separate debit/credit columns exist:
+        if (dbCol !== null || crCol !== null) {
+          const hasDebit = debitNum !== null && debitNum > 0;
+          const hasCredit = creditNum !== null && creditNum > 0;
+          
+          if (hasDebit && hasCredit) {
+            status = 'invalid';
+            errorMsg = 'Both debit and credit found in same row. Please verify.';
+          } else if (!hasDebit && !hasCredit) {
+            status = 'invalid';
+            errorMsg = 'No debit/credit amount found.';
+          } else if (hasDebit) {
+            detectedVoucherType = 'Payment';
+            finalAmount = debitNum!;
+          } else if (hasCredit) {
+            detectedVoucherType = 'Receipt';
+            finalAmount = creditNum!;
+          }
+        } 
+        // If single amount + Dr/Cr indicator exists:
+        else if (aCol !== null && dcCol !== null) {
+          if (drCrStr === 'Dr') {
+            detectedVoucherType = 'Payment';
+            finalAmount = Math.abs(amountNum);
+          } else if (drCrStr === 'Cr') {
+            detectedVoucherType = 'Receipt';
+            finalAmount = Math.abs(amountNum);
+          } else {
+            status = 'invalid';
+            errorMsg = 'Unable to identify Dr/Cr indicator.';
+          }
+        } 
+        // If only single amount exists:
+        else if (aCol !== null) {
+          if (detectedVoucherMode === 'payment') {
+            detectedVoucherType = 'Payment';
+            finalAmount = Math.abs(amountNum);
+          } else if (detectedVoucherMode === 'receipt') {
+            detectedVoucherType = 'Receipt';
+            finalAmount = Math.abs(amountNum);
+          } else {
+            status = 'invalid';
+            errorMsg = 'Single amount column found without Dr/Cr indicator. Please select Payment Only or Receipt Only mode.';
+          }
+        } else {
+          status = 'invalid';
+          errorMsg = 'No amount or debit/credit column mapped.';
+        }
+        
+        // Skip logic based on screen mode
+        let excluded = false;
+        if (status === 'valid') {
+          if (voucherMode === 'payment' && detectedVoucherType === 'Receipt') {
+            status = 'warning';
+            errorMsg = 'Skipped: Credit row in Payment only mode';
+            excluded = true;
+          } else if (voucherMode === 'receipt' && detectedVoucherType === 'Payment') {
+            status = 'warning';
+            errorMsg = 'Skipped: Debit row in Receipt only mode';
+            excluded = true;
+          }
+        }
+        
+        // Get enhanced ledger suggestion
+        const suggestion = suggestLedgerForNarrationEnhanced(description, tallyContext);
+        
+        results.push({
+          rowNo: r + 1, // Excel row number (1-indexed)
+          date: dateStr,
+          description,
+          debit: debitNum,
+          credit: creditNum,
+          amount: finalAmount,
+          drCr: drCrStr,
+          detectedVoucherType,
+          suggestedLedger: suggestion.ledgerName,
+          confidence: Math.round(suggestion.confidence * 100),
+          userLedger: suggestion.ledgerName,
+          reference,
+          status,
+          errorMsg,
+          excluded,
+          reasoning: suggestion.reasoning
+        });
+      }
+      
+      setBankStatementRows(results);
+      setCurrentStep('bank-statement-review');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to apply detection mappings.");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const downloadReviewedTemplateExcel = () => {
+    try {
+      const validRows = bankStatementRows.filter(row => !row.excluded && row.status !== 'invalid');
+      if (validRows.length === 0) {
+        alert("No valid, non-excluded rows available to download.");
+        return;
+      }
+
+      const data = validRows.map(row => ({
+        'Date': row.date,
+        'Particulars': row.userLedger,
+        'Voucher Type': row.detectedVoucherType,
+        'Voucher No': '',
+        'Amount': row.amount,
+        'Narration': row.description,
+        'Reference': row.reference
+      }));
+
+      const worksheet = XLSX.utils.json_to_sheet(data);
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, worksheet, 'Reviewed Vouchers');
+      XLSX.writeFile(workbook, `Reviewed_${pendingFileName || 'BankStatement'}.xlsx`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to download reviewed template excel");
+    }
+  };
+
   // --- File Handling ---
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -1478,78 +1976,30 @@ export default function App() {
         if (file.type === 'application/pdf') {
           const text = await extractTextFromPdf(file);
           const rawRows = parseBankStatementTextLocally(text);
-          const results = rawRows.map((row, idx) => {
-            const suggestedLedger = suggestLedgerForNarration(row.description, tallyContext);
-            let detectedVoucherType: 'Payment' | 'Receipt' | 'Unknown' = 'Unknown';
-            let status: 'valid' | 'invalid' | 'warning' = 'valid';
-            let errorMsg = '';
-            let finalAmount = row.amount || 0;
+          if (rawRows.length === 0) throw new Error("No transactions could be parsed from PDF.");
 
-            const hasDebit = row.debit !== null && row.debit > 0;
-            const hasCredit = row.credit !== null && row.credit > 0;
+          const headers = ['Date', 'Narration', 'Debit', 'Credit', 'Amount'];
+          const grid = [
+            headers,
+            ...rawRows.map(r => [r.date, r.description, r.debit, r.credit, r.amount])
+          ];
 
-            if (hasDebit && hasCredit) {
-              status = 'invalid';
-              errorMsg = 'Both debit and credit found in same row. Please verify.';
-            } else if (!hasDebit && !hasCredit && !finalAmount) {
-              status = 'invalid';
-              errorMsg = 'Debit, Credit, and Amount are all blank.';
-            } else if (hasDebit) {
-              detectedVoucherType = 'Payment';
-              finalAmount = row.debit!;
-            } else if (hasCredit) {
-              detectedVoucherType = 'Receipt';
-              finalAmount = row.credit!;
-            } else {
-              if (selectedVoucherType === 'Payment') {
-                detectedVoucherType = 'Payment';
-                status = 'warning';
-                errorMsg = 'Single Amount column found. Voucher type has been applied using selected screen mode.';
-              } else if (selectedVoucherType === 'Receipt') {
-                detectedVoucherType = 'Receipt';
-                status = 'warning';
-                errorMsg = 'Single Amount column found. Voucher type has been applied using selected screen mode.';
-              }
-            }
-
-            let excluded = false;
-            if (status === 'valid' || status === 'warning') {
-              if (voucherMode === 'payment') {
-                if (detectedVoucherType === 'Receipt') {
-                  status = 'warning';
-                  errorMsg = 'Skipped: Credit row in Payment only mode';
-                  excluded = true;
-                }
-              } else if (voucherMode === 'receipt') {
-                if (detectedVoucherType === 'Payment') {
-                  status = 'warning';
-                  errorMsg = 'Skipped: Debit row in Receipt only mode';
-                  excluded = true;
-                }
-              }
-            }
-
-            return {
-              rowNo: idx + 1,
-              rawRow: row,
-              date: row.date,
-              rawDate: row.date,
-              description: row.description,
-              debit: row.debit,
-              credit: row.credit,
-              amount: finalAmount,
-              detectedVoucherType,
-              suggestedLedger,
-              userLedger: suggestedLedger,
-              reference: row.reference || '',
-              status,
-              errorMsg,
-              excluded
-            };
+          setRawGrid(grid);
+          setHeaderRowIdx(0);
+          setDataStartRowIdx(1);
+          setDataEndRowIdx(grid.length - 1);
+          setColumnMappings({
+            date: 0,
+            narration: 1,
+            debit: 2,
+            credit: 3,
+            amount: 4,
+            drCr: null,
+            balance: null,
+            reference: null
           });
 
-          setBankStatementRows(results);
-          setCurrentStep('bank-statement-review');
+          setCurrentStep('bank-statement-detection-review');
           setIsProcessing(false);
         } else {
           const reader = new FileReader();
@@ -1559,13 +2009,23 @@ export default function App() {
               const workbook = XLSX.read(data, { type: 'array', cellDates: true });
               const firstSheetName = workbook.SheetNames[0];
               const worksheet = workbook.Sheets[firstSheetName];
-              const jsonData = XLSX.utils.sheet_to_json(worksheet);
               
-              if (jsonData.length === 0) throw new Error("Excel file is empty");
+              // Get raw grid as a 2D array!
+              const rawRows = XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as any[][];
+              if (rawRows.length === 0) throw new Error("Excel/CSV file is empty");
 
-              const results = parseBankStatementExcelOrCsv(jsonData, voucherMode);
-              setBankStatementRows(results);
-              setCurrentStep('bank-statement-review');
+              // Save to state
+              setRawGrid(rawRows);
+
+              // Auto-detect structure!
+              const detected = autoDetectBankStatement(rawRows);
+              setHeaderRowIdx(detected.headerRowIdx);
+              setDataStartRowIdx(detected.dataStartRowIdx);
+              setDataEndRowIdx(detected.dataEndRowIdx);
+              setColumnMappings(detected.mappings);
+
+              // Go to detection review!
+              setCurrentStep('bank-statement-detection-review');
               setIsProcessing(false);
             } catch (err) {
               setError(err instanceof Error ? err.message : "Failed to parse bank statement file");
@@ -1643,16 +2103,29 @@ export default function App() {
 
             // Use AI mappings to extract bank transactions correctly
             const dateCol = aiMappings.find(m => m.tallyField === 'DATE')?.excelColumn;
-            let descCol = aiMappings.find(m => m.tallyField === 'NARRATION')?.excelColumn || 
-                          aiMappings.find(m => m.tallyField === 'PARTYNAME')?.excelColumn;
+            let descCol = aiMappings.find(m => m.tallyField === 'NARRATION')?.excelColumn;
             const amtCol = aiMappings.find(m => m.tallyField === 'AMOUNT')?.excelColumn;
 
-            // Defensive: If AI mapped Date to Narration, try to find another candidate for Narration
-            if (descCol === dateCol) {
+            // Extract the PARTYNAME / Particulars column separately from NARRATION
+            let partyCol = aiMappings.find(m => m.tallyField === 'PARTYNAME')?.excelColumn;
+            if (!partyCol) {
+              const partyAliases = ['party name', 'partyname', 'particulars', 'ledger', 'ledger name', 'account'];
+              partyCol = headers.find(h => 
+                partyAliases.some(alias => h.toLowerCase().trim() === alias)
+              ) || headers.find(h => 
+                partyAliases.some(alias => h.toLowerCase().trim().includes(alias))
+              );
+            }
+
+            // If NARRATION is not found or is the same as DATE or PARTYNAME, find/fallback NARRATION
+            if (!descCol || descCol === dateCol || descCol === partyCol) {
               descCol = headers.find(h => 
+                h !== dateCol && h !== partyCol &&
                 !['date', 'amount', 'balance', 'vch', 'no'].some(k => h.toLowerCase().includes(k)) &&
                 ['particulars', 'description', 'narration', 'remarks', 'details'].some(k => h.toLowerCase().includes(k))
-              ) || descCol;
+              ) || descCol || headers.find(h => 
+                ['particulars', 'description', 'narration', 'remarks', 'details'].some(k => h.toLowerCase().includes(k))
+              );
             }
 
             const bankTransactions: BankTransaction[] = jsonData.map((row: any) => {
@@ -1675,6 +2148,7 @@ export default function App() {
               if (!narration || String(narration).trim() === '') {
                 const commonNarrationHeaders = ['narration', 'particulars', 'description', 'remarks', 'details', 'txn details', 'transaction details'];
                 for (const h of commonNarrationHeaders) {
+                  if (h === partyCol) continue; // Prefer not using the party column for narration
                   const val = getValueByHeader(row, h);
                   if (val && String(val).trim() !== '') {
                     narration = val;
@@ -1683,16 +2157,31 @@ export default function App() {
                 }
               }
 
+              // Extract particulars value
+              let particularsStr = '';
+              if (partyCol) {
+                const rawParticulars = getValueByHeader(row, partyCol);
+                particularsStr = rawParticulars !== undefined && rawParticulars !== null ? String(rawParticulars).trim() : '';
+              }
+
               return {
                 date: String(dateVal),
                 description: String(narration || 'No Narration Found'),
-                amount: isNaN(parsedAmount) ? 0 : parsedAmount
+                amount: isNaN(parsedAmount) ? 0 : parsedAmount,
+                particulars: particularsStr
               };
             });
 
             if (tallyContext) {
               const mapped = await mapBankTransactions(bankTransactions, tallyContext.ledgers, tallyContext.historicalMappings);
               setAiMappedTransactions(mapped);
+            } else {
+              setAiMappedTransactions(bankTransactions.map(tx => ({
+                ...tx,
+                tallyLedger: tx.particulars || '',
+                confidence: tx.particulars ? 1.0 : 0,
+                reasoning: tx.particulars ? 'Preserved user-provided ledger.' : 'No Tally masters uploaded.'
+              })));
             }
             
             setCurrentStep('mapping');
@@ -2298,10 +2787,23 @@ export default function App() {
           throw new Error(`Row ${rowIndex + 1}: Invalid Date value "${dateVal || ''}". Error: ${dateNorm.error}`);
         }
 
+        // If partyNameVal is blank but a mapped suggestion/final ledger exists for that row, use that final ledger.
+        if (!partyNameVal || partyNameVal.trim() === '') {
+          const mappedTx = aiMappedTransactions[rowIndex];
+          if (mappedTx && mappedTx.tallyLedger && mappedTx.tallyLedger.trim() !== '') {
+            partyNameVal = mappedTx.tallyLedger.trim();
+          }
+        }
+
+        // If no ledger exists, block XML generation with row-wise error instead of using "Unknown".
+        if (!partyNameVal || partyNameVal.trim() === '') {
+          throw new Error(`Row ${rowIndex + 1}: Particulars / Party Ledger is blank or unmapped. Please select or provide a valid ledger.`);
+        }
+
         const voucher: TallyVoucher = {
           date: dateNorm.value,
           voucherType: selectedVoucherType,
-          partyName: partyNameVal || 'Unknown',
+          partyName: partyNameVal,
           voucherNumber: voucherNumberVal || undefined,
           narration: narrationVal || undefined,
           reference: referenceVal || undefined,
@@ -3140,6 +3642,460 @@ export default function App() {
                 </motion.section>
               )}
 
+              {currentStep === 'bank-statement-detection-review' && (
+                <motion.section 
+                  key="bank-statement-detection-review"
+                  initial={{ opacity: 0, x: -20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: 20 }}
+                  className="bg-white p-6 rounded-2xl border border-zinc-200 shadow-sm space-y-6"
+                >
+                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-zinc-100 pb-5">
+                    <div>
+                      <h2 className="text-xl font-bold flex items-center gap-2 text-zinc-900">
+                        <Sparkles className="w-5 h-5 text-zinc-800 animate-pulse" />
+                        Bank Statement Detection Review
+                      </h2>
+                      <p className="text-xs text-zinc-500 mt-1 leading-relaxed">
+                        Verify and customize the automatically detected sheet structure, row boundaries, and column mappings.
+                      </p>
+                    </div>
+                    <div className="text-right">
+                      <span className="text-xs bg-zinc-100 px-3 py-1.5 rounded-lg text-zinc-700 font-semibold block md:inline-block">
+                        {pendingFileName}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    {/* Left: Row Boundaries & Modes (1/3 width) */}
+                    <div className="space-y-4 lg:col-span-1">
+                      <div className="bg-zinc-50/50 p-4 rounded-xl border border-zinc-200/50 space-y-4">
+                        <h3 className="text-sm font-bold text-zinc-800 flex items-center gap-2 pb-2 border-b border-zinc-200/60">
+                          <FileText className="w-4 h-4 text-zinc-500" />
+                          Row Settings
+                        </h3>
+
+                        <div>
+                          <label className="block text-xs font-semibold text-zinc-600 mb-1">
+                            Header Row (1-Indexed)
+                          </label>
+                          <input 
+                            type="number"
+                            min="1"
+                            max={rawGrid.length}
+                            value={headerRowIdx + 1}
+                            onChange={(e) => {
+                              const val = parseInt(e.target.value) - 1;
+                              if (!isNaN(val) && val >= 0 && val < rawGrid.length) {
+                                setHeaderRowIdx(val);
+                              }
+                            }}
+                            className="w-full p-2.5 bg-white border border-zinc-200 rounded-lg text-xs outline-none focus:ring-1 focus:ring-zinc-950 font-medium"
+                          />
+                          <span className="text-[10px] text-zinc-400 mt-1 block">
+                            Used to find column names and auto-detect mapping.
+                          </span>
+                        </div>
+
+                        <div>
+                          <label className="block text-xs font-semibold text-zinc-600 mb-1">
+                            Data Start Row (1-Indexed)
+                          </label>
+                          <input 
+                            type="number"
+                            min="1"
+                            max={rawGrid.length}
+                            value={dataStartRowIdx + 1}
+                            onChange={(e) => {
+                              const val = parseInt(e.target.value) - 1;
+                              if (!isNaN(val) && val >= 0 && val < rawGrid.length) {
+                                setDataStartRowIdx(val);
+                              }
+                            }}
+                            className="w-full p-2.5 bg-white border border-zinc-200 rounded-lg text-xs outline-none focus:ring-1 focus:ring-zinc-950 font-medium"
+                          />
+                          <span className="text-[10px] text-zinc-400 mt-1 block">
+                            Where actual transactions begin (skips opening balance).
+                          </span>
+                        </div>
+
+                        <div>
+                          <label className="block text-xs font-semibold text-zinc-600 mb-1">
+                            Data End Row (1-Indexed)
+                          </label>
+                          <input 
+                            type="number"
+                            min="1"
+                            max={rawGrid.length}
+                            value={dataEndRowIdx + 1}
+                            onChange={(e) => {
+                              const val = parseInt(e.target.value) - 1;
+                              if (!isNaN(val) && val >= 0 && val < rawGrid.length) {
+                                setDataEndRowIdx(val);
+                              }
+                            }}
+                            className="w-full p-2.5 bg-white border border-zinc-200 rounded-lg text-xs outline-none focus:ring-1 focus:ring-zinc-950 font-medium"
+                          />
+                          <span className="text-[10px] text-zinc-400 mt-1 block">
+                            Where transactions end (ignores summaries or total rows).
+                          </span>
+                        </div>
+
+                        <div>
+                          <label className="block text-xs font-semibold text-zinc-600 mb-1">
+                            Single-Amount Mode Default
+                          </label>
+                          <select
+                            value={detectedVoucherMode}
+                            onChange={(e) => setDetectedVoucherMode(e.target.value as any)}
+                            className="w-full p-2.5 bg-white border border-zinc-200 rounded-lg text-xs outline-none focus:ring-1 focus:ring-zinc-950 font-medium"
+                          >
+                            <option value="auto">Auto-detect from Debit/Credit</option>
+                            <option value="payment">All Rows as Payment (Debit)</option>
+                            <option value="receipt">All Rows as Receipt (Credit)</option>
+                          </select>
+                          <span className="text-[10px] text-zinc-400 mt-1 block">
+                            Fallback for statement tables with a single amount column.
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Right: Column Mapping Dropdowns (2/3 width) */}
+                    <div className="space-y-4 lg:col-span-2">
+                      <div className="bg-zinc-50/50 p-4 rounded-xl border border-zinc-200/50">
+                        <h3 className="text-sm font-bold text-zinc-800 flex items-center gap-2 pb-2 border-b border-zinc-200/60 mb-4">
+                          <Database className="w-4 h-4 text-zinc-500" />
+                          Column Mappings
+                        </h3>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          {/* Date Column Mapping */}
+                          <div>
+                            <label className="block text-xs font-semibold text-zinc-700 mb-1">
+                              Date Column <span className="text-red-500">*</span>
+                            </label>
+                            <select
+                              value={columnMappings.date ?? ''}
+                              onChange={(e) => {
+                                const val = e.target.value === '' ? null : parseInt(e.target.value);
+                                setColumnMappings(prev => ({ ...prev, date: val }));
+                              }}
+                              className="w-full p-2.5 bg-white border border-zinc-200 rounded-lg text-xs outline-none focus:ring-1 focus:ring-zinc-950 font-medium"
+                            >
+                              <option value="">-- Unmapped --</option>
+                              {Array.from({ length: rawGrid.reduce((max, r) => Math.max(max, r.length), 0) }, (_, c) => {
+                                const colLetter = String.fromCharCode(65 + (c % 26)) + (c >= 26 ? Math.floor(c / 26) : '');
+                                const val = rawGrid[headerRowIdx]?.[c];
+                                const label = val !== undefined && val !== null ? String(val).trim() : '';
+                                return <option key={c} value={c}>{colLetter} - {label || '(Empty cell)'}</option>;
+                              })}
+                            </select>
+                          </div>
+
+                          {/* Narration Column Mapping */}
+                          <div>
+                            <label className="block text-xs font-semibold text-zinc-700 mb-1">
+                              Narration Column <span className="text-red-500">*</span>
+                            </label>
+                            <select
+                              value={columnMappings.narration ?? ''}
+                              onChange={(e) => {
+                                const val = e.target.value === '' ? null : parseInt(e.target.value);
+                                setColumnMappings(prev => ({ ...prev, narration: val }));
+                              }}
+                              className="w-full p-2.5 bg-white border border-zinc-200 rounded-lg text-xs outline-none focus:ring-1 focus:ring-zinc-950 font-medium"
+                            >
+                              <option value="">-- Unmapped --</option>
+                              {Array.from({ length: rawGrid.reduce((max, r) => Math.max(max, r.length), 0) }, (_, c) => {
+                                const colLetter = String.fromCharCode(65 + (c % 26)) + (c >= 26 ? Math.floor(c / 26) : '');
+                                const val = rawGrid[headerRowIdx]?.[c];
+                                const label = val !== undefined && val !== null ? String(val).trim() : '';
+                                return <option key={c} value={c}>{colLetter} - {label || '(Empty cell)'}</option>;
+                              })}
+                            </select>
+                          </div>
+
+                          {/* Debit Column Mapping */}
+                          <div>
+                            <label className="block text-xs font-semibold text-zinc-700 mb-1">
+                              Debit / Withdrawal Column (Optional)
+                            </label>
+                            <select
+                              value={columnMappings.debit ?? ''}
+                              onChange={(e) => {
+                                const val = e.target.value === '' ? null : parseInt(e.target.value);
+                                setColumnMappings(prev => ({ ...prev, debit: val }));
+                              }}
+                              className="w-full p-2.5 bg-white border border-zinc-200 rounded-lg text-xs outline-none focus:ring-1 focus:ring-zinc-950 font-medium"
+                            >
+                              <option value="">-- Unmapped --</option>
+                              {Array.from({ length: rawGrid.reduce((max, r) => Math.max(max, r.length), 0) }, (_, c) => {
+                                const colLetter = String.fromCharCode(65 + (c % 26)) + (c >= 26 ? Math.floor(c / 26) : '');
+                                const val = rawGrid[headerRowIdx]?.[c];
+                                const label = val !== undefined && val !== null ? String(val).trim() : '';
+                                return <option key={c} value={c}>{colLetter} - {label || '(Empty cell)'}</option>;
+                              })}
+                            </select>
+                          </div>
+
+                          {/* Credit Column Mapping */}
+                          <div>
+                            <label className="block text-xs font-semibold text-zinc-700 mb-1">
+                              Credit / Deposit Column (Optional)
+                            </label>
+                            <select
+                              value={columnMappings.credit ?? ''}
+                              onChange={(e) => {
+                                const val = e.target.value === '' ? null : parseInt(e.target.value);
+                                setColumnMappings(prev => ({ ...prev, credit: val }));
+                              }}
+                              className="w-full p-2.5 bg-white border border-zinc-200 rounded-lg text-xs outline-none focus:ring-1 focus:ring-zinc-950 font-medium"
+                            >
+                              <option value="">-- Unmapped --</option>
+                              {Array.from({ length: rawGrid.reduce((max, r) => Math.max(max, r.length), 0) }, (_, c) => {
+                                const colLetter = String.fromCharCode(65 + (c % 26)) + (c >= 26 ? Math.floor(c / 26) : '');
+                                const val = rawGrid[headerRowIdx]?.[c];
+                                const label = val !== undefined && val !== null ? String(val).trim() : '';
+                                return <option key={c} value={c}>{colLetter} - {label || '(Empty cell)'}</option>;
+                              })}
+                            </select>
+                          </div>
+
+                          {/* Amount Column Mapping */}
+                          <div>
+                            <label className="block text-xs font-semibold text-zinc-700 mb-1">
+                              Single Amount Column (Optional)
+                            </label>
+                            <select
+                              value={columnMappings.amount ?? ''}
+                              onChange={(e) => {
+                                const val = e.target.value === '' ? null : parseInt(e.target.value);
+                                setColumnMappings(prev => ({ ...prev, amount: val }));
+                              }}
+                              className="w-full p-2.5 bg-white border border-zinc-200 rounded-lg text-xs outline-none focus:ring-1 focus:ring-zinc-950 font-medium"
+                            >
+                              <option value="">-- Unmapped --</option>
+                              {Array.from({ length: rawGrid.reduce((max, r) => Math.max(max, r.length), 0) }, (_, c) => {
+                                const colLetter = String.fromCharCode(65 + (c % 26)) + (c >= 26 ? Math.floor(c / 26) : '');
+                                const val = rawGrid[headerRowIdx]?.[c];
+                                const label = val !== undefined && val !== null ? String(val).trim() : '';
+                                return <option key={c} value={c}>{colLetter} - {label || '(Empty cell)'}</option>;
+                              })}
+                            </select>
+                          </div>
+
+                          {/* DrCr Indicator Mapping */}
+                          <div>
+                            <label className="block text-xs font-semibold text-zinc-700 mb-1">
+                              Dr / Cr Indicator (Optional)
+                            </label>
+                            <select
+                              value={columnMappings.drCr ?? ''}
+                              onChange={(e) => {
+                                const val = e.target.value === '' ? null : parseInt(e.target.value);
+                                setColumnMappings(prev => ({ ...prev, drCr: val }));
+                              }}
+                              className="w-full p-2.5 bg-white border border-zinc-200 rounded-lg text-xs outline-none focus:ring-1 focus:ring-zinc-950 font-medium"
+                            >
+                              <option value="">-- Unmapped --</option>
+                              {Array.from({ length: rawGrid.reduce((max, r) => Math.max(max, r.length), 0) }, (_, c) => {
+                                const colLetter = String.fromCharCode(65 + (c % 26)) + (c >= 26 ? Math.floor(c / 26) : '');
+                                const val = rawGrid[headerRowIdx]?.[c];
+                                const label = val !== undefined && val !== null ? String(val).trim() : '';
+                                return <option key={c} value={c}>{colLetter} - {label || '(Empty cell)'}</option>;
+                              })}
+                            </select>
+                          </div>
+
+                          {/* Reference Mapping */}
+                          <div>
+                            <label className="block text-xs font-semibold text-zinc-700 mb-1">
+                              Reference / Cheque No (Optional)
+                            </label>
+                            <select
+                              value={columnMappings.reference ?? ''}
+                              onChange={(e) => {
+                                const val = e.target.value === '' ? null : parseInt(e.target.value);
+                                setColumnMappings(prev => ({ ...prev, reference: val }));
+                              }}
+                              className="w-full p-2.5 bg-white border border-zinc-200 rounded-lg text-xs outline-none focus:ring-1 focus:ring-zinc-950 font-medium"
+                            >
+                              <option value="">-- Unmapped --</option>
+                              {Array.from({ length: rawGrid.reduce((max, r) => Math.max(max, r.length), 0) }, (_, c) => {
+                                const colLetter = String.fromCharCode(65 + (c % 26)) + (c >= 26 ? Math.floor(c / 26) : '');
+                                const val = rawGrid[headerRowIdx]?.[c];
+                                const label = val !== undefined && val !== null ? String(val).trim() : '';
+                                return <option key={c} value={c}>{colLetter} - {label || '(Empty cell)'}</option>;
+                              })}
+                            </select>
+                          </div>
+
+                          {/* Balance Mapping */}
+                          <div>
+                            <label className="block text-xs font-semibold text-zinc-700 mb-1">
+                              Balance Column (Optional, Ignored)
+                            </label>
+                            <select
+                              value={columnMappings.balance ?? ''}
+                              onChange={(e) => {
+                                const val = e.target.value === '' ? null : parseInt(e.target.value);
+                                setColumnMappings(prev => ({ ...prev, balance: val }));
+                              }}
+                              className="w-full p-2.5 bg-white border border-zinc-200 rounded-lg text-xs outline-none focus:ring-1 focus:ring-zinc-950 font-medium"
+                            >
+                              <option value="">-- Unmapped --</option>
+                              {Array.from({ length: rawGrid.reduce((max, r) => Math.max(max, r.length), 0) }, (_, c) => {
+                                const colLetter = String.fromCharCode(65 + (c % 26)) + (c >= 26 ? Math.floor(c / 26) : '');
+                                const val = rawGrid[headerRowIdx]?.[c];
+                                const label = val !== undefined && val !== null ? String(val).trim() : '';
+                                return <option key={c} value={c}>{colLetter} - {label || '(Empty cell)'}</option>;
+                              })}
+                            </select>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Raw Data Preview */}
+                  <div className="space-y-2">
+                    <h3 className="text-xs font-bold text-zinc-700 uppercase tracking-wider">
+                      Detected Transactions Preview (First 10 Rows)
+                    </h3>
+                    <div className="border border-zinc-200 rounded-xl overflow-hidden bg-white shadow-sm max-h-[300px] overflow-y-auto">
+                      <table className="w-full text-xs text-left border-collapse">
+                        <thead className="bg-zinc-50 text-zinc-600 font-bold border-b border-zinc-200 sticky top-0">
+                          <tr>
+                            <th className="p-2 w-12 text-center">Row</th>
+                            <th className="p-2">Date</th>
+                            <th className="p-2 max-w-xs">Narration</th>
+                            <th className="p-2 text-right">Debit</th>
+                            <th className="p-2 text-right">Credit</th>
+                            <th className="p-2 text-right">Amount</th>
+                            <th className="p-2 text-center">Dr/Cr</th>
+                            <th className="p-2">Reference</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-zinc-100 font-medium">
+                          {(() => {
+                            const pStart = Math.max(0, dataStartRowIdx);
+                            const pEnd = Math.min(rawGrid.length - 1, dataStartRowIdx + 9);
+                            const previewRowsList = [];
+                            
+                            const dCol = columnMappings.date;
+                            const nCol = columnMappings.narration;
+                            const dbCol = columnMappings.debit;
+                            const crCol = columnMappings.credit;
+                            const aCol = columnMappings.amount;
+                            const dcCol = columnMappings.drCr;
+                            const rCol = columnMappings.reference;
+
+                            for (let r = pStart; r <= pEnd; r++) {
+                              const row = rawGrid[r];
+                              if (!row) continue;
+                              
+                              let dateStr = '';
+                              let dVal = dCol !== null ? row[dCol] : '';
+                              if (dVal instanceof Date) {
+                                dateStr = `${dVal.getDate()}/${dVal.getMonth()+1}/${dVal.getFullYear()}`;
+                              } else if (dVal !== undefined && dVal !== null) {
+                                dateStr = String(dVal);
+                              }
+
+                              previewRowsList.push(
+                                <tr key={r} className="hover:bg-zinc-50/50">
+                                  <td className="p-2 text-center font-mono text-zinc-500">{r + 1}</td>
+                                  <td className="p-2 font-semibold text-zinc-800">{dateStr}</td>
+                                  <td className="p-2 max-w-xs truncate" title={nCol !== null ? String(row[nCol] || '') : ''}>
+                                    {nCol !== null ? String(row[nCol] || '') : <span className="text-zinc-400">Not mapped</span>}
+                                  </td>
+                                  <td className="p-2 text-right font-mono text-rose-600">
+                                    {dbCol !== null && row[dbCol] !== undefined && row[dbCol] !== null ? String(row[dbCol]) : '-'}
+                                  </td>
+                                  <td className="p-2 text-right font-mono text-emerald-600">
+                                    {crCol !== null && row[crCol] !== undefined && row[crCol] !== null ? String(row[crCol]) : '-'}
+                                  </td>
+                                  <td className="p-2 text-right font-mono text-zinc-900">
+                                    {aCol !== null && row[aCol] !== undefined && row[aCol] !== null ? String(row[aCol]) : '-'}
+                                  </td>
+                                  <td className="p-2 text-center font-mono text-zinc-500">
+                                    {dcCol !== null && row[dcCol] !== undefined && row[dcCol] !== null ? String(row[dcCol]) : '-'}
+                                  </td>
+                                  <td className="p-2 truncate max-w-[120px]">
+                                    {rCol !== null && row[rCol] !== undefined && row[rCol] !== null ? String(row[rCol]) : '-'}
+                                  </td>
+                                </tr>
+                              );
+                            }
+                            
+                            if (previewRowsList.length === 0) {
+                              return (
+                                <tr>
+                                  <td colSpan={8} className="p-4 text-center text-zinc-400">
+                                    No data rows in range. Please adjust Start and End row values.
+                                  </td>
+                                </tr>
+                              );
+                            }
+                            return previewRowsList;
+                          })()}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  {/* Actions Row */}
+                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pt-4 border-t border-zinc-100">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRawGrid([]);
+                        setCurrentStep('upload');
+                      }}
+                      className="px-5 py-3 hover:bg-zinc-100 border border-zinc-200 text-zinc-700 rounded-xl text-xs font-bold transition-all flex items-center gap-2 self-start md:self-auto"
+                    >
+                      <RotateCcw className="w-4 h-4" />
+                      Back to Upload
+                    </button>
+                    <div className="flex flex-wrap items-center gap-3 justify-end shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const detected = autoDetectBankStatement(rawGrid);
+                          setHeaderRowIdx(detected.headerRowIdx);
+                          setDataStartRowIdx(detected.dataStartRowIdx);
+                          setDataEndRowIdx(detected.dataEndRowIdx);
+                          setColumnMappings(detected.mappings);
+                        }}
+                        className="px-4 py-3 bg-zinc-100 hover:bg-zinc-200 text-zinc-800 rounded-xl text-xs font-bold transition-all"
+                      >
+                        Reset to Autodetect
+                      </button>
+                      <button
+                        type="button"
+                        onClick={applyDetectionAndMapLedgers}
+                        disabled={isProcessing}
+                        className="px-5 py-3 bg-zinc-900 hover:bg-zinc-850 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-2 shadow-sm"
+                      >
+                        {isProcessing ? (
+                          <>
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            Mapping Ledgers...
+                          </>
+                        ) : (
+                          <>
+                            <Sparkles className="w-4 h-4 text-amber-300" />
+                            Use Detected Mapping / Continue
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                </motion.section>
+              )}
+
               {currentStep === 'bank-statement-review' && (
                 <motion.section 
                   key="bank-statement-review"
@@ -3196,17 +4152,20 @@ export default function App() {
                     <table className="w-full text-xs text-left border-collapse">
                       <thead className="bg-zinc-50 text-zinc-600 uppercase font-bold border-b border-zinc-200 sticky top-0 z-10">
                         <tr>
+                          <th className="p-3 w-16 text-center">Include</th>
                           <th className="p-3 w-12 text-center">Row</th>
                           <th className="p-3 w-24">Date</th>
                           <th className="p-3 max-w-xs">Narration / Description</th>
                           <th className="p-3 text-right">Debit (Dr)</th>
                           <th className="p-3 text-right">Credit (Cr)</th>
                           <th className="p-3 text-right">Amount</th>
+                          <th className="p-3 text-center">Dr/Cr</th>
                           <th className="p-3 w-24 text-center">Vch Type</th>
-                          <th className="p-3 w-56">Particulars Ledger (Tally)</th>
+                          <th className="p-3 w-40">Suggested Ledger</th>
+                          <th className="p-3 w-16 text-center">Conf %</th>
+                          <th className="p-3 w-56">Final Ledger Dropdown</th>
                           <th className="p-3 w-24">Reference</th>
-                          <th className="p-3 w-32">Status / Message</th>
-                          <th className="p-3 w-16 text-center">Exclude</th>
+                          <th className="p-3 w-32">Status & Error</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-zinc-100">
@@ -3228,6 +4187,18 @@ export default function App() {
                                       : 'hover:bg-zinc-50/50'
                               }`}
                             >
+                              <td className="p-3 text-center">
+                                <input
+                                  type="checkbox"
+                                  checked={!row.excluded}
+                                  onChange={(e) => {
+                                    const updated = [...bankStatementRows];
+                                    updated[idx].excluded = !e.target.checked;
+                                    setBankStatementRows(updated);
+                                  }}
+                                  className="rounded border-zinc-300 text-zinc-900 focus:ring-zinc-950 w-4 h-4 cursor-pointer"
+                                />
+                              </td>
                               <td className="p-3 text-center font-mono font-medium">{row.rowNo}</td>
                               <td className="p-3 font-medium whitespace-nowrap">{row.date}</td>
                               <td className="p-3 max-w-xs truncate font-medium" title={row.description}>
@@ -3242,6 +4213,9 @@ export default function App() {
                               <td className="p-3 text-right font-mono font-bold text-zinc-900">
                                 {row.amount.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
                               </td>
+                              <td className="p-3 text-center font-mono text-zinc-500 font-semibold">
+                                {row.drCr || (row.detectedVoucherType === 'Payment' ? 'Dr' : 'Cr')}
+                              </td>
                               <td className="p-3 text-center">
                                 <span className={`inline-block px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider ${
                                   row.detectedVoucherType === 'Payment'
@@ -3251,6 +4225,20 @@ export default function App() {
                                       : 'bg-zinc-100 text-zinc-600'
                                 }`}>
                                   {row.detectedVoucherType}
+                                </span>
+                              </td>
+                              <td className="p-3 font-medium text-zinc-700 truncate max-w-[150px]" title={row.reasoning || row.suggestedLedger}>
+                                {row.suggestedLedger || <span className="text-zinc-400 italic">No suggestion</span>}
+                              </td>
+                              <td className="p-3 text-center">
+                                <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                                  row.confidence >= 90
+                                    ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                    : row.confidence >= 50
+                                      ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                                      : 'bg-zinc-100 text-zinc-600'
+                                }`}>
+                                  {row.confidence ? `${row.confidence}%` : '0%'}
                                 </span>
                               </td>
                               <td className="p-2">
@@ -3288,15 +4276,21 @@ export default function App() {
                               <td className="p-3 font-medium whitespace-nowrap">{row.reference}</td>
                               <td className="p-3">
                                 {isInvalid && (
-                                  <span className="text-rose-600 font-semibold flex items-center gap-1" title={row.errorMsg}>
-                                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                                    Error
+                                  <span className="text-rose-600 font-semibold flex flex-col gap-0.5" title={row.errorMsg}>
+                                    <span className="flex items-center gap-1">
+                                      <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                                      Error
+                                    </span>
+                                    <span className="text-[9px] font-normal text-rose-500 leading-tight block truncate max-w-[120px]">{row.errorMsg}</span>
                                   </span>
                                 )}
                                 {isWarning && (
-                                  <span className="text-amber-600 font-semibold flex items-center gap-1" title={row.errorMsg}>
-                                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                                    Warning
+                                  <span className="text-amber-600 font-semibold flex flex-col gap-0.5" title={row.errorMsg}>
+                                    <span className="flex items-center gap-1">
+                                      <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                                      Warning
+                                    </span>
+                                    <span className="text-[9px] font-normal text-amber-500 leading-tight block truncate max-w-[120px]">{row.errorMsg}</span>
                                   </span>
                                 )}
                                 {!isInvalid && !isWarning && !isExcluded && (
@@ -3311,18 +4305,6 @@ export default function App() {
                                   </span>
                                 )}
                               </td>
-                              <td className="p-3 text-center">
-                                <input
-                                  type="checkbox"
-                                  checked={row.excluded}
-                                  onChange={(e) => {
-                                    const updated = [...bankStatementRows];
-                                    updated[idx].excluded = e.target.checked;
-                                    setBankStatementRows(updated);
-                                  }}
-                                  className="rounded border-zinc-300 text-zinc-900 focus:ring-zinc-950 w-4 h-4 cursor-pointer"
-                                />
-                              </td>
                             </tr>
                           );
                         })}
@@ -3336,6 +4318,14 @@ export default function App() {
                       <span className="font-bold text-zinc-700">Rules applied:</span> Valid rows and non-excluded warnings will be written to the generated Tally XML. Invalid rows or manually excluded rows will be skipped. Ledger dropdown utilizes uploaded Tally masters context.
                     </div>
                     <div className="flex items-center gap-3 justify-end shrink-0">
+                      <button
+                        type="button"
+                        onClick={downloadReviewedTemplateExcel}
+                        className="px-5 py-3 bg-zinc-100 hover:bg-zinc-200 text-zinc-800 border border-zinc-200 rounded-xl text-xs font-bold transition-all flex items-center gap-2"
+                      >
+                        <Download className="w-4 h-4" />
+                        Download Reviewed Excel
+                      </button>
                       <button
                         type="button"
                         onClick={() => {
@@ -3467,8 +4457,35 @@ export default function App() {
                             </div>
                             <p className="text-zinc-900 font-medium mb-2">{tx.description}</p>
                             <div className="flex items-center gap-2 p-2 bg-white rounded-lg border border-zinc-200">
-                              <ArrowRight className="w-3 h-3 text-zinc-400" />
-                              <span className="font-bold text-zinc-900">{tx.tallyLedger}</span>
+                              <ArrowRight className="w-3 h-3 text-zinc-400 shrink-0" />
+                              <span className="text-xs text-zinc-500 font-semibold shrink-0">Ledger:</span>
+                              {tallyContext ? (
+                                <select
+                                  value={tx.tallyLedger || ''}
+                                  onChange={(e) => {
+                                    const updated = [...aiMappedTransactions];
+                                    updated[idx].tallyLedger = e.target.value;
+                                    setAiMappedTransactions(updated);
+                                  }}
+                                  className="flex-1 bg-transparent font-bold text-zinc-900 outline-none border border-zinc-200 py-1 text-xs cursor-pointer focus:ring-1 focus:ring-zinc-950 rounded px-1"
+                                >
+                                  <option value="">-- Select Ledger --</option>
+                                  {tallyContext.ledgers.map((l, lIdx) => (
+                                    <option key={lIdx} value={l}>{l}</option>
+                                  ))}
+                                </select>
+                              ) : (
+                                <input
+                                  type="text"
+                                  value={tx.tallyLedger || ''}
+                                  onChange={(e) => {
+                                    const updated = [...aiMappedTransactions];
+                                    updated[idx].tallyLedger = e.target.value;
+                                    setAiMappedTransactions(updated);
+                                  }}
+                                  className="flex-1 bg-transparent font-bold text-zinc-900 outline-none border border-zinc-200 py-1 text-xs px-2 focus:ring-1 focus:ring-zinc-950 rounded"
+                                />
+                              )}
                             </div>
                             <p className="text-[11px] text-zinc-500 mt-2 italic">Reason: {tx.reasoning}</p>
                           </div>

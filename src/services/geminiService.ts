@@ -130,6 +130,7 @@ export interface BankTransaction {
   debit?: number;
   credit?: number;
   amount: number;
+  particulars?: string;
 }
 
 export interface MappedTransaction extends BankTransaction {
@@ -180,96 +181,79 @@ export async function mapBankTransactions(
   tallyLedgers: string[],
   historicalMappings?: { narration: string; ledger: string }[]
 ): Promise<MappedTransaction[]> {
-  if (!isGeminiAvailable()) {
-    return transactions.map(tx => {
-      const cleanNarr = tx.description.toLowerCase().trim();
-      let matchedLedger = '';
+  const hasSuspense = tallyLedgers.includes('Suspense Account');
 
-      // 1. Exact historical
-      if (historicalMappings) {
-        const exact = historicalMappings.find(h => h.narration.toLowerCase().trim() === cleanNarr);
-        if (exact && tallyLedgers.includes(exact.ledger)) {
-          matchedLedger = exact.ledger;
+  // We should process transactions and apply the Rules!
+  // Rule I: If Particulars / Ledger field is already filled in standard template, preserve it!
+  const results = transactions.map(tx => {
+    if (tx.particulars && tx.particulars.trim() !== '') {
+      return {
+        ...tx,
+        tallyLedger: tx.particulars.trim(),
+        confidence: 1.0,
+        reasoning: 'Preserved user-provided ledger from Excel file.'
+      };
+    }
+
+    // Otherwise, try to suggest ledger using local deterministic keyword / historical mappings logic!
+    const cleanNarr = tx.description.toLowerCase().trim();
+    let matchedLedger = '';
+    let confidence = 0;
+    let reasoning = '';
+
+    // 1. Exact historical
+    if (historicalMappings) {
+      const exact = historicalMappings.find(h => h.narration.toLowerCase().trim() === cleanNarr);
+      if (exact && tallyLedgers.includes(exact.ledger)) {
+        matchedLedger = exact.ledger;
+        confidence = 1.0;
+        reasoning = 'Matched exact historical narration from Daybook';
+      }
+    }
+
+    // 2. Keyword match
+    if (!matchedLedger) {
+      for (const ledger of tallyLedgers) {
+        const ledgerLower = ledger.toLowerCase().trim();
+        if (cleanNarr.includes(ledgerLower) && ledgerLower.length > 3) {
+          matchedLedger = ledger;
+          confidence = 0.90;
+          reasoning = `Found exact ledger name "${ledger}" in narration`;
+          break;
         }
       }
+    }
 
-      // 2. Keyword match
-      if (!matchedLedger) {
-        for (const ledger of tallyLedgers) {
-          if (cleanNarr.includes(ledger.toLowerCase()) && ledger.length > 3) {
-            matchedLedger = ledger;
-            break;
-          }
-        }
-      }
-
-      // 3. No fallback to Suspense Account if no match found
-      if (!matchedLedger) {
-        return {
-          ...tx,
-          tallyLedger: '',
-          confidence: 0,
-          reasoning: 'No reliable local match. User review required.'
-        };
-      }
-
+    // If confidence is high (>= 90%), keep it. Otherwise, use Suspense fallback!
+    if (matchedLedger && confidence >= 0.90) {
       return {
         ...tx,
         tallyLedger: matchedLedger,
-        confidence: 0.9,
-        reasoning: `Mapped deterministically using Local Mapping Engine.`
-      };
-    });
-  }
-
-  const prompt = `
-    You are an expert Indian Accountant. Your task is to map bank statement transactions to the correct Tally Ledger.
-    
-    CRITICAL RULES:
-    1. PRIORITIZE HISTORICAL DATA: Look at the "Historical Mappings" provided below. If a new transaction's description (Narration) contains keywords or patterns similar to a historical narration, use the same ledger.
-    2. AVOID SUSPENSE: Do not map to "Suspense Account" or "Unknown" unless there is absolutely no clue. Try to categorize based on common business patterns (e.g., "UPI" often relates to small expenses or sales, "Salary" to Salary Ledger, "Rent" to Rent Ledger).
-    3. FUZZY MATCHING: Even if the narration is slightly different (e.g., "UPI/123/Zomato" vs "Zomato Payment"), identify the core keyword ("Zomato") and map it to the corresponding ledger.
-    4. KEYWORD MATCHING: If a description (Narration) contains a company name (e.g., "Airtel", "HDFC Life", "Zomato"), look for a ledger that matches that name or its category (e.g., Telephone Expenses, Insurance, Staff Welfare).
-    5. REASONING: For every mapping, provide a clear reason (e.g., "Matched keyword 'Zomato' from historical narration data" or "Categorized as 'Bank Charges' based on description pattern").
-    
-    Available Tally Ledgers: ${tallyLedgers.join(', ')}
-    
-    ${historicalMappings && historicalMappings.length > 0 ? `
-    Historical Mappings (Reference these for patterns):
-    ${historicalMappings.slice(0, 100).map(m => `- "${m.narration}" was mapped to "${m.ledger}"`).join('\n')}
-    ` : ''}
-    
-    New Transactions to Map: ${JSON.stringify(transactions)}
-    
-    Return a JSON array of mapped transactions.
-  `;
-
-  const response = await getAI().models.generateContent({
-    model: "gemini-3.1-pro-preview",
-    contents: prompt,
-    config: {
-      thinkingConfig: {
-        thinkingLevel: ThinkingLevel.HIGH
-      },
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            date: { type: Type.STRING },
-            description: { type: Type.STRING },
-            reference: { type: Type.STRING },
-            amount: { type: Type.NUMBER },
-            tallyLedger: { type: Type.STRING },
-            confidence: { type: Type.NUMBER },
-            reasoning: { type: Type.STRING }
-          },
-          required: ["date", "description", "amount", "tallyLedger", "confidence", "reasoning"]
-        }
+        confidence,
+        reasoning
+      } as MappedTransaction;
+    } else {
+      if (hasSuspense) {
+        return {
+          ...tx,
+          tallyLedger: 'Suspense Account',
+          confidence: matchedLedger ? confidence : 0,
+          reasoning: matchedLedger
+            ? `Match found ("${matchedLedger}" with ${(confidence*100).toFixed(0)}% confidence) is below 90% threshold. Fallback to Suspense.`
+            : 'No reliable local match. Fallback to Suspense.'
+        } as MappedTransaction;
+      } else {
+        return {
+          ...tx,
+          tallyLedger: '',
+          confidence: matchedLedger ? confidence : 0,
+          reasoning: matchedLedger
+            ? `Match found ("${matchedLedger}" with ${(confidence*100).toFixed(0)}% confidence) is below 90% threshold. "Suspense Account" not found.`
+            : 'No reliable local match. "Suspense Account" not found.'
+        } as MappedTransaction;
       }
     }
   });
 
-  return JSON.parse(response.text);
+  return results;
 }
