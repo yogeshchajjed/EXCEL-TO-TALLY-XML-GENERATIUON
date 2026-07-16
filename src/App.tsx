@@ -55,6 +55,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import * as XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
 import { XMLParser } from 'fast-xml-parser';
 import * as pdfjsLib from 'pdfjs-dist';
 import { getAIColumnMapping, ColumnMapping, mapBankTransactions, BankTransaction, MappedTransaction, parseBankStatementText, isGeminiAvailable } from './services/geminiService';
@@ -69,7 +70,9 @@ import {
   TallyLedgerMaster, 
   TallyStockItemMaster, 
   TallyStockGroupMaster, 
-  TallyUnitMaster 
+  TallyUnitMaster,
+  SalesPurchaseInvoice,
+  generateSalesPurchaseXML
 } from './lib/tallyXml';
 
 // Set up PDF.js worker
@@ -100,6 +103,8 @@ interface TallyContext {
   stockItemStockGroupMap?: Record<string, string>; // Stock item to stock group mapping
   historicalMappings?: { narration: string; ledger: string }[];
   groupParentMap?: Record<string, string>; // Maps group name to parent group name
+  ledgerDetails?: LedgerMasterRow[];
+  stockItemDetails?: StockMasterRow[];
 }
 
 interface LedgerMasterRow {
@@ -264,7 +269,415 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [mappings, setMappings] = useState<ColumnMapping[]>([]);
-  const [currentStep, setCurrentStep] = useState<'upload' | 'mapping' | 'complete' | 'context' | 'master-review' | 'bank-statement-review' | 'bank-statement-detection-review'>('upload');
+  const [currentStep, setCurrentStep] = useState<'upload' | 'mapping' | 'complete' | 'context' | 'master-review' | 'bank-statement-review' | 'bank-statement-detection-review' | 'verification' | 'sales-purchase-verification'>('upload');
+  const [companyState, setCompanyState] = useState<string>('Maharashtra');
+  const [salesPurchaseInvoices, setSalesPurchaseInvoices] = useState<SalesPurchaseInvoice[]>([]);
+  const [selectedInvoiceIdx, setSelectedInvoiceIdx] = useState<number>(0);
+
+  const updateActiveInvoice = (updater: (inv: SalesPurchaseInvoice) => void) => {
+    if (!salesPurchaseInvoices[selectedInvoiceIdx]) return;
+    const updated = [...salesPurchaseInvoices];
+    const copy = JSON.parse(JSON.stringify(updated[selectedInvoiceIdx]));
+    updater(copy);
+    recalculateInvoice(copy, companyState);
+    updated[selectedInvoiceIdx] = copy;
+    setSalesPurchaseInvoices(updated);
+  };
+
+  // --- GST and Invoice Auto calculations helper ---
+  const findGSTLedger = (ledgers: string[], voucherType: 'Sales' | 'Purchase', gstType: 'CGST' | 'SGST' | 'IGST', rate: number): string => {
+    const isSales = voucherType === 'Sales';
+    const rateHalf = gstType === 'IGST' ? rate : (rate / 2);
+    const searchTerms = [
+      `${gstType.toLowerCase()} ${isSales ? 'output' : 'input'} ${rateHalf}%`,
+      `${gstType.toLowerCase()} ${isSales ? 'output' : 'input'} ${rateHalf}`,
+      `${gstType.toLowerCase()} ${rateHalf}%`,
+      `${gstType.toLowerCase()} ${rateHalf}`,
+      `${gstType} ${isSales ? 'Output' : 'Input'}`,
+      gstType,
+    ];
+
+    for (const term of searchTerms) {
+      const found = ledgers.find(l => l.toLowerCase().replace(/\s+/g, ' ').includes(term.toLowerCase()));
+      if (found) return found;
+    }
+
+    const anyMatch = ledgers.find(l => l.toLowerCase().includes(gstType.toLowerCase()));
+    if (anyMatch) return anyMatch;
+
+    return `${gstType} ${isSales ? 'Output' : 'Input'} ${rateHalf}%`;
+  };
+
+  const processSalesPurchaseExcel = (jsonData: any[]): SalesPurchaseInvoice[] => {
+    const getVal = (row: any, key: string): any => {
+      if (row[key] !== undefined) return row[key];
+      const foundKey = Object.keys(row).find(k => k.toLowerCase().trim() === key.toLowerCase().trim());
+      return foundKey ? row[foundKey] : undefined;
+    };
+
+    const groups: Record<string, any[]> = {};
+    jsonData.forEach((row, idx) => {
+      const vType = String(getVal(row, 'Voucher Type') || getVal(row, 'VoucherType') || 'Sales').trim();
+      let invDate = getVal(row, 'Invoice Date') || getVal(row, 'InvoiceDate') || getVal(row, 'Date') || '';
+      
+      if (invDate instanceof Date) {
+        invDate = invDate.toLocaleDateString('en-GB');
+      } else if (typeof invDate === 'number' && invDate > 40000) {
+        const date = new Date((invDate - 25569) * 86400 * 1000);
+        invDate = date.toLocaleDateString('en-GB');
+      } else {
+        invDate = String(invDate).trim();
+      }
+
+      const invNo = String(getVal(row, 'Invoice No') || getVal(row, 'InvoiceNo') || getVal(row, 'Voucher No') || getVal(row, 'VoucherNo') || `TEMP-${idx}`).trim();
+      const party = String(getVal(row, 'Party Ledger') || getVal(row, 'PartyLedger') || getVal(row, 'Particulars') || '').trim();
+
+      const key = `${vType}_${invDate}_${invNo}_${party}`;
+      if (!groups[key]) {
+        groups[key] = [];
+      }
+      groups[key].push(row);
+    });
+
+    const parsedInvoices: SalesPurchaseInvoice[] = [];
+
+    Object.entries(groups).forEach(([key, rows]) => {
+      const firstRow = rows[0];
+      const vType = String(getVal(firstRow, 'Voucher Type') || getVal(firstRow, 'VoucherType') || 'Sales').trim() as 'Sales' | 'Purchase';
+      
+      let invDate = getVal(firstRow, 'Invoice Date') || getVal(firstRow, 'InvoiceDate') || getVal(firstRow, 'Date') || '';
+      if (invDate instanceof Date) {
+        invDate = invDate.toLocaleDateString('en-GB');
+      } else if (typeof invDate === 'number' && invDate > 40000) {
+        const date = new Date((invDate - 25569) * 86400 * 1000);
+        invDate = date.toLocaleDateString('en-GB');
+      } else {
+        invDate = String(invDate).trim();
+      }
+
+      const invNo = String(getVal(firstRow, 'Invoice No') || getVal(firstRow, 'InvoiceNo') || getVal(firstRow, 'Voucher No') || getVal(firstRow, 'VoucherNo') || '').trim();
+      const partyLedger = String(getVal(firstRow, 'Party Ledger') || getVal(firstRow, 'PartyLedger') || getVal(firstRow, 'Particulars') || '').trim();
+      const salesPurchaseLedger = String(getVal(firstRow, 'Sales/Purchase Ledger') || getVal(firstRow, 'Sales/PurchaseLedger') || (vType === 'Sales' ? 'Sales Account' : 'Purchase Account')).trim();
+      const narration = String(getVal(firstRow, 'Narration') || '').trim();
+      const reference = String(getVal(firstRow, 'Reference') || '').trim();
+
+      let dispatchDate = getVal(firstRow, 'Dispatch Date') || getVal(firstRow, 'DispatchDate') || '';
+      if (dispatchDate instanceof Date) {
+        dispatchDate = dispatchDate.toLocaleDateString('en-GB');
+      } else if (typeof dispatchDate === 'number' && dispatchDate > 40000) {
+        const date = new Date((dispatchDate - 25569) * 86400 * 1000);
+        dispatchDate = date.toLocaleDateString('en-GB');
+      } else {
+        dispatchDate = String(dispatchDate).trim();
+      }
+
+      const deliveryNoteNo = String(getVal(firstRow, 'Delivery Note No') || getVal(firstRow, 'DeliveryNoteNo') || '').trim();
+      const dispatchDocNo = String(getVal(firstRow, 'Dispatch Doc No') || getVal(firstRow, 'DispatchDocNo') || '').trim();
+      const biltyLRNo = String(getVal(firstRow, 'Bilty LR No') || getVal(firstRow, 'BiltyLRNo') || '').trim();
+      const transporterName = String(getVal(firstRow, 'Transporter Name') || getVal(firstRow, 'TransporterName') || '').trim();
+      const transporterGSTIN = String(getVal(firstRow, 'Transporter GSTIN') || getVal(firstRow, 'TransporterGSTIN') || '').trim();
+      const vehicleNo = String(getVal(firstRow, 'Vehicle No') || getVal(firstRow, 'VehicleNo') || '').trim();
+      const destination = String(getVal(firstRow, 'Destination') || '').trim();
+      const modeOfTransport = String(getVal(firstRow, 'Mode of Transport') || getVal(firstRow, 'ModeOfTransport') || '').trim();
+      const ewayBillNo = String(getVal(firstRow, 'Eway Bill No') || getVal(firstRow, 'EwayBillNo') || '').trim();
+
+      let partyGSTIN = String(getVal(firstRow, 'Party GSTIN') || getVal(firstRow, 'PartyGSTIN') || '').trim();
+      let partyAddress1 = String(getVal(firstRow, 'Party Address 1') || getVal(firstRow, 'PartyAddress1') || '').trim();
+      let partyAddress2 = String(getVal(firstRow, 'Party Address 2') || getVal(firstRow, 'PartyAddress2') || '').trim();
+      let partyState = String(getVal(firstRow, 'Party State') || getVal(firstRow, 'PartyState') || '').trim();
+      let placeOfSupply = String(getVal(firstRow, 'Place of Supply') || getVal(firstRow, 'PlaceOfSupply') || '').trim();
+
+      let partyRegistrationType = String(getVal(firstRow, 'Party Registration Type') || getVal(firstRow, 'PartyRegistrationType') || '').trim();
+      const pMaster = tallyContext?.ledgerDetails?.find(ld => ld.ledgerName.toLowerCase() === partyLedger.toLowerCase());
+      if (pMaster) {
+        if (!partyGSTIN) partyGSTIN = pMaster.gstin || '';
+        if (!partyAddress1) partyAddress1 = pMaster.address1 || '';
+        if (!partyAddress2) partyAddress2 = pMaster.address2 || '';
+        if (!partyState) partyState = pMaster.state || '';
+        if (!partyRegistrationType) partyRegistrationType = pMaster.registrationType || '';
+      }
+      if (!placeOfSupply) placeOfSupply = partyState;
+      if (!partyRegistrationType) {
+        partyRegistrationType = partyGSTIN ? 'Regular' : 'Unregistered';
+      }
+
+      const freightLedger = String(getVal(firstRow, 'Freight Ledger') || getVal(firstRow, 'FreightLedger') || '').trim();
+      const freightAmount = parseFloat(String(getVal(firstRow, 'Freight Amount') || getVal(firstRow, 'FreightAmount') || '0').replace(/,/g, '')) || 0;
+
+      const packingLedger = String(getVal(firstRow, 'Packing Ledger') || getVal(firstRow, 'PackingLedger') || '').trim();
+      const packingAmount = parseFloat(String(getVal(firstRow, 'Packing Amount') || getVal(firstRow, 'PackingAmount') || '0').replace(/,/g, '')) || 0;
+
+      const loadingLedger = String(getVal(firstRow, 'Loading Ledger') || getVal(firstRow, 'LoadingLedger') || '').trim();
+      const loadingAmount = parseFloat(String(getVal(firstRow, 'Loading Amount') || getVal(firstRow, 'LoadingAmount') || '0').replace(/,/g, '')) || 0;
+
+      const insuranceLedger = String(getVal(firstRow, 'Insurance Ledger') || getVal(firstRow, 'InsuranceLedger') || '').trim();
+      const insuranceAmount = parseFloat(String(getVal(firstRow, 'Insurance Amount') || getVal(firstRow, 'InsuranceAmount') || '0').replace(/,/g, '')) || 0;
+
+      const otherLedger1 = String(getVal(firstRow, 'Other Ledger 1') || getVal(firstRow, 'OtherLedger1') || '').trim();
+      const otherAmount1 = parseFloat(String(getVal(firstRow, 'Other Amount 1') || getVal(firstRow, 'OtherAmount1') || '0').replace(/,/g, '')) || 0;
+
+      const otherLedger2 = String(getVal(firstRow, 'Other Ledger 2') || getVal(firstRow, 'OtherLedger2') || '').trim();
+      const otherAmount2 = parseFloat(String(getVal(firstRow, 'Other Amount 2') || getVal(firstRow, 'OtherAmount2') || '0').replace(/,/g, '')) || 0;
+
+      const discountLedger = String(getVal(firstRow, 'Discount Ledger') || getVal(firstRow, 'DiscountLedger') || '').trim();
+      const billDiscountAmount = parseFloat(String(getVal(firstRow, 'Bill Discount Amount') || getVal(firstRow, 'BillDiscountAmount') || '0').replace(/,/g, '')) || 0;
+
+      const roundOffLedger = String(getVal(firstRow, 'Round Off Ledger') || getVal(firstRow, 'RoundOffLedger') || '').trim();
+      const roundOffAmount = parseFloat(String(getVal(firstRow, 'Round Off Amount') || getVal(firstRow, 'RoundOffAmount') || '0').replace(/,/g, '')) || 0;
+
+      const items: SalesPurchaseInvoice['items'] = [];
+
+      rows.forEach(r => {
+        const stockItem = String(getVal(r, 'Stock Item') || getVal(r, 'StockItem') || '').trim();
+        if (!stockItem) return;
+
+        const description = String(getVal(r, 'Description') || '').trim();
+        const quantity = parseFloat(String(getVal(r, 'Quantity') || '0').replace(/,/g, '')) || 0;
+        let unit = String(getVal(r, 'Unit') || '').trim();
+        const rate = parseFloat(String(getVal(r, 'Rate') || '0').replace(/,/g, '')) || 0;
+        let itemAmount = parseFloat(String(getVal(r, 'Item Amount') || getVal(r, 'ItemAmount') || '0').replace(/,/g, '')) || 0;
+        if (itemAmount === 0) itemAmount = quantity * rate;
+
+        const discountPercent = parseFloat(String(getVal(r, 'Discount %') || getVal(r, 'DiscountPercent') || '0').replace(/,/g, '')) || 0;
+        let discountAmount = parseFloat(String(getVal(r, 'Discount Amount') || getVal(r, 'DiscountAmount') || '0').replace(/,/g, '')) || 0;
+        if (discountAmount === 0 && discountPercent > 0) discountAmount = itemAmount * discountPercent / 100;
+
+        let taxableValue = parseFloat(String(getVal(r, 'Taxable Value') || getVal(r, 'TaxableValue') || '0').replace(/,/g, '')) || 0;
+        if (taxableValue === 0) taxableValue = itemAmount - discountAmount;
+
+        let hsn = String(getVal(r, 'HSN/SAC') || getVal(r, 'HSN') || '').trim();
+        let gstRate = parseFloat(String(getVal(r, 'GST Rate %') || getVal(r, 'GSTRate') || '0').replace(/,/g, '')) || 0;
+
+        const sMaster = tallyContext?.stockItemDetails?.find(si => si.itemName.toLowerCase() === stockItem.toLowerCase());
+        let gstRateSource: 'Stock Master' | 'User Entered' = 'User Entered';
+        if (sMaster) {
+          if (!unit) unit = sMaster.unit || '';
+          if (!hsn) hsn = sMaster.hsn || '';
+          if (gstRate === 0 && sMaster.gstRate) {
+            gstRate = parseFloat(sMaster.gstRate);
+            gstRateSource = 'Stock Master';
+          }
+        }
+
+        const cgstLedger = String(getVal(r, 'CGST Ledger') || getVal(r, 'CGSTLedger') || '').trim();
+        const cgstAmount = parseFloat(String(getVal(r, 'CGST Amount') || getVal(r, 'CGSTAmount') || '0').replace(/,/g, '')) || 0;
+
+        const sgstLedger = String(getVal(r, 'SGST Ledger') || getVal(r, 'SGSTLedger') || '').trim();
+        const sgstAmount = parseFloat(String(getVal(r, 'SGST Amount') || getVal(r, 'SGSTAmount') || '0').replace(/,/g, '')) || 0;
+
+        const igstLedger = String(getVal(r, 'IGST Ledger') || getVal(r, 'IGSTLedger') || '').trim();
+        const igstAmount = parseFloat(String(getVal(r, 'IGST Amount') || getVal(r, 'IGSTAmount') || '0').replace(/,/g, '')) || 0;
+
+        items.push({
+          stockItem,
+          description,
+          quantity,
+          unit: unit || 'NOS',
+          rate,
+          itemAmount,
+          discountPercent,
+          discountAmount,
+          taxableValue,
+          hsn,
+          gstRate,
+          cgstLedger,
+          cgstAmount,
+          sgstLedger,
+          sgstAmount,
+          igstLedger,
+          igstAmount,
+          gstRateSource
+        });
+      });
+
+      const firstRowGstMode = String(getVal(firstRow, 'GST Mode') || getVal(firstRow, 'GSTMode') || 'Auto').trim() as 'Auto' | 'Manual';
+
+      const inv: SalesPurchaseInvoice = {
+        voucherType: vType,
+        invoiceDate: invDate,
+        invoiceNo: invNo,
+        partyLedger,
+        salesPurchaseLedger,
+        narration,
+        reference,
+        dispatchDate,
+        deliveryNoteNo,
+        dispatchDocNo,
+        biltyLRNo,
+        transporterName,
+        transporterGSTIN,
+        vehicleNo,
+        destination,
+        modeOfTransport,
+        ewayBillNo,
+        partyGSTIN,
+        partyAddress1,
+        partyAddress2,
+        partyState,
+        placeOfSupply,
+        partyRegistrationType,
+        items,
+        gstMode: firstRowGstMode === 'Manual' ? 'Manual' : 'Auto',
+        freightLedger,
+        freightAmount,
+        packingLedger,
+        packingAmount,
+        loadingLedger,
+        loadingAmount,
+        insuranceLedger,
+        insuranceAmount,
+        otherLedger1,
+        otherAmount1,
+        otherLedger2,
+        otherAmount2,
+        discountLedger,
+        billDiscountAmount,
+        roundOffLedger,
+        roundOffAmount,
+        totalTaxableValue: 0,
+        totalCGST: 0,
+        totalSGST: 0,
+        totalIGST: 0,
+        totalAdditionalCharges: 0,
+        invoiceTotal: 0,
+        errors: [],
+        warnings: [],
+        isValid: true
+      };
+
+      parsedInvoices.push(inv);
+    });
+
+    return parsedInvoices;
+  };
+
+  const recalculateInvoice = (inv: SalesPurchaseInvoice, currentCompanyState: string) => {
+    let totalTaxableValue = 0;
+    let totalCGST = 0;
+    let totalSGST = 0;
+    let totalIGST = 0;
+
+    const ledgersList = tallyContext?.ledgers || [];
+
+    inv.items.forEach(item => {
+      totalTaxableValue += item.taxableValue;
+
+      if (inv.gstMode === 'Auto') {
+        const isSameState = String(inv.placeOfSupply || '').toLowerCase().trim() === String(currentCompanyState).toLowerCase().trim();
+        if (isSameState) {
+          item.cgstAmount = item.taxableValue * (item.gstRate / 100) / 2;
+          item.sgstAmount = item.taxableValue * (item.gstRate / 100) / 2;
+          item.igstAmount = 0;
+          item.cgstLedger = findGSTLedger(ledgersList, inv.voucherType, 'CGST', item.gstRate);
+          item.sgstLedger = findGSTLedger(ledgersList, inv.voucherType, 'SGST', item.gstRate);
+          item.igstLedger = '';
+        } else {
+          item.cgstAmount = 0;
+          item.sgstAmount = 0;
+          item.igstAmount = item.taxableValue * (item.gstRate / 100);
+          item.cgstLedger = '';
+          item.sgstLedger = '';
+          item.igstLedger = findGSTLedger(ledgersList, inv.voucherType, 'IGST', item.gstRate);
+        }
+      }
+
+      totalCGST += item.cgstAmount;
+      totalSGST += item.sgstAmount;
+      totalIGST += item.igstAmount;
+    });
+
+    inv.totalTaxableValue = totalTaxableValue;
+    inv.totalCGST = totalCGST;
+    inv.totalSGST = totalSGST;
+    inv.totalIGST = totalIGST;
+
+    inv.totalAdditionalCharges = inv.freightAmount + inv.packingAmount + inv.loadingAmount + inv.insuranceAmount + inv.otherAmount1 + inv.otherAmount2 - inv.billDiscountAmount;
+
+    const totalBeforeRoundOff = totalTaxableValue + totalCGST + totalSGST + totalIGST + inv.totalAdditionalCharges;
+
+    if (inv.roundOffLedger && inv.roundOffAmount === 0) {
+      const rounded = Math.round(totalBeforeRoundOff);
+      inv.roundOffAmount = rounded - totalBeforeRoundOff;
+    }
+
+    inv.invoiceTotal = totalBeforeRoundOff + inv.roundOffAmount;
+
+    const errors: string[] = [];
+    const warnings: string[] = [];
+
+    const dNorm = normalizeTallyDate(inv.invoiceDate);
+    if (!dNorm.isValid) {
+      errors.push(`Invalid Invoice Date: ${dNorm.error}`);
+    } else {
+      inv.invoiceDate = dNorm.value;
+    }
+
+    if (!inv.invoiceNo) errors.push("Invoice Number is blank.");
+    if (!inv.partyLedger) errors.push("Party Ledger is blank.");
+
+    if (tallyContext) {
+      const pExists = tallyContext.ledgers.some(l => l.toLowerCase() === inv.partyLedger.toLowerCase());
+      if (!pExists) {
+        warnings.push(`Party Ledger "${inv.partyLedger}" not found in Tally masters.`);
+      }
+      const sExists = tallyContext.ledgers.some(l => l.toLowerCase() === inv.salesPurchaseLedger.toLowerCase());
+      if (!sExists) {
+        warnings.push(`${inv.voucherType} Ledger "${inv.salesPurchaseLedger}" not found in Tally masters.`);
+      }
+
+      inv.items.forEach((item, itemIdx) => {
+        const itemPrefix = `Item ${itemIdx + 1} (${item.stockItem}):`;
+        const iExists = tallyContext.stockItems?.some(s => s.toLowerCase() === item.stockItem.toLowerCase());
+        if (!iExists) {
+          warnings.push(`${itemPrefix} Stock Item not found in Tally masters.`);
+        }
+
+        // Auto-resolve empty HSN from stock item details in context
+        if (!item.hsn && tallyContext?.stockItemDetails) {
+          const sMaster = tallyContext.stockItemDetails.find(sm => sm.itemName.toLowerCase() === item.stockItem.toLowerCase());
+          if (sMaster && sMaster.hsn) {
+            item.hsn = sMaster.hsn;
+          }
+        }
+
+        if (!item.hsn || !item.hsn.trim()) {
+          errors.push(`${itemPrefix} HSN/SAC is blank. A valid HSN/SAC is mandatory for GST reporting.`);
+        }
+
+        if (item.cgstAmount > 0 && !item.cgstLedger) {
+          errors.push(`${itemPrefix} CGST Ledger required but not selected.`);
+        } else if (item.cgstAmount > 0 && !tallyContext.ledgers.some(l => l.toLowerCase() === item.cgstLedger?.toLowerCase())) {
+          warnings.push(`${itemPrefix} CGST Ledger "${item.cgstLedger}" not found in Tally masters.`);
+        }
+
+        if (item.sgstAmount > 0 && !item.sgstLedger) {
+          errors.push(`${itemPrefix} SGST Ledger required but not selected.`);
+        } else if (item.sgstAmount > 0 && !tallyContext.ledgers.some(l => l.toLowerCase() === item.sgstLedger?.toLowerCase())) {
+          warnings.push(`${itemPrefix} SGST Ledger "${item.sgstLedger}" not found in Tally masters.`);
+        }
+
+        if (item.igstAmount > 0 && !item.igstLedger) {
+          errors.push(`${itemPrefix} IGST Ledger required but not selected.`);
+        } else if (item.igstAmount > 0 && !tallyContext.ledgers.some(l => l.toLowerCase() === item.igstLedger?.toLowerCase())) {
+          warnings.push(`${itemPrefix} IGST Ledger "${item.igstLedger}" not found in Tally masters.`);
+        }
+      });
+
+      if (inv.freightAmount !== 0 && !inv.freightLedger) errors.push("Freight amount entered but ledger is blank.");
+      if (inv.packingAmount !== 0 && !inv.packingLedger) errors.push("Packing amount entered but ledger is blank.");
+      if (inv.loadingAmount !== 0 && !inv.loadingLedger) errors.push("Loading amount entered but ledger is blank.");
+      if (inv.insuranceAmount !== 0 && !inv.insuranceLedger) errors.push("Insurance amount entered but ledger is blank.");
+      if (inv.otherAmount1 !== 0 && !inv.otherLedger1) errors.push("Other Amount 1 entered but ledger is blank.");
+      if (inv.otherAmount2 !== 0 && !inv.otherLedger2) errors.push("Other Amount 2 entered but ledger is blank.");
+      if (inv.billDiscountAmount !== 0 && !inv.discountLedger) errors.push("Bill discount entered but ledger is blank.");
+      if (inv.roundOffAmount !== 0 && !inv.roundOffLedger) errors.push("Round Off adjustment exists but ledger is blank.");
+    }
+
+    inv.errors = errors;
+    inv.warnings = warnings;
+    inv.isValid = errors.length === 0;
+  };
+
   const [pendingData, setPendingData] = useState<any[]>([]);
   const [pendingFileName, setPendingFileName] = useState('');
   const [tallyContext, setTallyContext] = useState<TallyContext | null>(null);
@@ -272,6 +685,31 @@ export default function App() {
   const [selectedVoucherType, setSelectedVoucherType] = useState('Payment');
   const [selectedBankLedger, setSelectedBankLedger] = useState('');
   const [aiMappedTransactions, setAiMappedTransactions] = useState<MappedTransaction[]>([]);
+  const [verificationRows, setVerificationRows] = useState<any[]>([]);
+  const [verificationSourceStep, setVerificationSourceStep] = useState<'bank-statement-review' | 'mapping'>('mapping');
+
+  const updateVerificationRowLedger = (idx: number, ledgerName: string) => {
+    // 1. Update verificationRows state
+    const updatedRows = [...verificationRows];
+    updatedRows[idx].finalLedger = ledgerName;
+    setVerificationRows(updatedRows);
+
+    // 2. Sync back to the source data
+    const originalIdx = updatedRows[idx].sourceIdx;
+    if (verificationSourceStep === 'bank-statement-review') {
+      if (originalIdx !== undefined && originalIdx >= 0 && originalIdx < bankStatementRows.length) {
+        const updatedBankRows = [...bankStatementRows];
+        updatedBankRows[originalIdx].userLedger = ledgerName;
+        setBankStatementRows(updatedBankRows);
+      }
+    } else {
+      if (originalIdx !== undefined && originalIdx >= 0 && originalIdx < aiMappedTransactions.length) {
+        const updatedMappedTx = [...aiMappedTransactions];
+        updatedMappedTx[originalIdx].tallyLedger = ledgerName;
+        setAiMappedTransactions(updatedMappedTx);
+      }
+    }
+  };
 
   // Master States
   const [importType, setImportType] = useState<'Voucher' | 'Ledger' | 'StockItem' | 'StockGroup' | 'Unit'>('Voucher');
@@ -457,7 +895,445 @@ export default function App() {
     return result;
   };
 
-  const downloadTemplate = (type: string) => {
+  const DEFAULT_LEDGERS = [
+    'Suspense Account',
+    'Cash',
+    'Profit & Loss A/c',
+    'Bank Account',
+    'Sales A/c',
+    'Purchase A/c',
+    'Indirect Expenses',
+    'Indirect Incomes',
+    'Salary Expense',
+    'Rent Expense',
+    'GST Ledger',
+  ];
+
+  const DEFAULT_GROUPS = [
+    'Primary',
+    'Sundry Debtors',
+    'Sundry Creditors',
+    'Bank Accounts',
+    'Cash-in-hand',
+    'Indirect Expenses',
+    'Indirect Incomes',
+    'Direct Expenses',
+    'Direct Incomes',
+    'Sales Accounts',
+    'Purchase Accounts',
+    'Capital Account',
+    'Loans (Liability)',
+    'Secured Loans',
+    'Unsecured Loans',
+    'Current Liabilities',
+    'Duties & Taxes',
+    'Provisions',
+    'Current Assets',
+    'Stock-in-hand',
+    'Loans & Advances (Asset)',
+    'Investments',
+    'Fixed Assets',
+    'Suspense A/c'
+  ];
+
+  const DEFAULT_STOCK_GROUPS = [
+    'Primary'
+  ];
+
+  const DEFAULT_UNITS = [
+    'NOS',
+    'PCS',
+    'BOX',
+    'KGS',
+    'MTR',
+    'SET',
+    'BAG',
+    'DOZ',
+    'HRS',
+    'MIN',
+  ];
+
+  const buildMastersSheet = (data: Record<string, string[]>) => {
+    const keys = Object.keys(data);
+    const maxLen = Math.max(...keys.map(k => data[k].length));
+    const rows = [];
+    for (let i = 0; i < maxLen; i++) {
+      const row: any = {};
+      keys.forEach(k => {
+        row[k] = data[k][i] !== undefined ? data[k][i] : '';
+      });
+      rows.push(row);
+    }
+    return XLSX.utils.json_to_sheet(rows, { header: keys });
+  };
+
+  const downloadTemplate = async (type: string) => {
+    if (type === 'Sales' || type === 'Purchase') {
+      const isSales = type === 'Sales';
+      const headers = [
+        'Invoice Date', 'Invoice No', 'Voucher Type', 'Party Ledger', 'Sales/Purchase Ledger',
+        'Stock Item', 'Description', 'Quantity', 'Unit', 'Rate', 'Item Amount', 'Discount %', 'Taxable Value', 'HSN/SAC',
+        'Party GSTIN', 'Party Address 1', 'Party Address 2', 'Party State', 'Place of Supply',
+        'Dispatch Date', 'Delivery Note No', 'Dispatch Doc No', 'Bilty LR No', 'Transporter Name', 'Transporter GSTIN', 'Vehicle No', 'Destination', 'Mode of Transport', 'Eway Bill No',
+        'GST Mode', 'GST Rate %', 'CGST Ledger', 'CGST Amount', 'SGST Ledger', 'SGST Amount', 'IGST Ledger', 'IGST Amount',
+        'Freight Ledger', 'Freight Amount', 'Packing Ledger', 'Packing Amount', 'Loading Ledger', 'Loading Amount', 'Insurance Ledger', 'Insurance Amount', 'Other Ledger 1', 'Other Amount 1', 'Other Ledger 2', 'Other Amount 2', 'Discount Ledger', 'Bill Discount Amount', 'Round Off Ledger', 'Round Off Amount',
+        'Narration', 'Reference'
+      ];
+
+      const sampleData = [
+        {
+          'Invoice Date': new Date().toLocaleDateString('en-GB'),
+          'Invoice No': 'INV-1001',
+          'Voucher Type': type,
+          'Party Ledger': isSales ? 'Cash-in-hand' : 'Sundry Creditors',
+          'Sales/Purchase Ledger': isSales ? 'Sales Account' : 'Purchase Account',
+          'Stock Item': 'Sample Stock Item',
+          'Description': 'High-quality item',
+          'Quantity': '10',
+          'Unit': 'NOS',
+          'Rate': '150',
+          'Item Amount': '1500',
+          'Discount %': '0',
+          'Taxable Value': '1500',
+          'HSN/SAC': '8517',
+          'Party GSTIN': '27ABCDE1234F1Z5',
+          'Party Address 1': '123 Business Lane',
+          'Party Address 2': 'Industrial Park',
+          'Party State': 'Maharashtra',
+          'Place of Supply': 'Maharashtra',
+          'Dispatch Date': new Date().toLocaleDateString('en-GB'),
+          'Delivery Note No': 'DN-505',
+          'Dispatch Doc No': 'DDN-808',
+          'Bilty LR No': 'LR-9099',
+          'Transporter Name': 'Express Cargo',
+          'Transporter GSTIN': '27ABCDE1234F1Z5',
+          'Vehicle No': 'MH-12-PQ-9999',
+          'Destination': 'Warehouse A',
+          'Mode of Transport': 'Road',
+          'Eway Bill No': '123456789012',
+          'GST Mode': 'Auto',
+          'GST Rate %': '18',
+          'CGST Ledger': 'CGST Output 9%',
+          'CGST Amount': '',
+          'SGST Ledger': 'SGST Output 9%',
+          'SGST Amount': '',
+          'IGST Ledger': '',
+          'IGST Amount': '',
+          'Freight Ledger': 'Freight Charges',
+          'Freight Amount': '100',
+          'Packing Ledger': 'Packing Expenses',
+          'Packing Amount': '50',
+          'Loading Ledger': '',
+          'Loading Amount': '',
+          'Insurance Ledger': '',
+          'Insurance Amount': '',
+          'Other Ledger 1': '',
+          'Other Amount 1': '',
+          'Other Ledger 2': '',
+          'Other Amount 2': '',
+          'Discount Ledger': '',
+          'Bill Discount Amount': '',
+          'Round Off Ledger': 'Round Off A/c',
+          'Round Off Amount': '0.50',
+          'Narration': `${type} invoice generated via TallyGen Pro`,
+          'Reference': 'REF-1001'
+        },
+        {
+          'Invoice Date': new Date().toLocaleDateString('en-GB'),
+          'Invoice No': 'INV-1001',
+          'Voucher Type': type,
+          'Party Ledger': isSales ? 'Cash-in-hand' : 'Sundry Creditors',
+          'Sales/Purchase Ledger': isSales ? 'Sales Account' : 'Purchase Account',
+          'Stock Item': 'Another Stock Item',
+          'Description': 'Item 2 description',
+          'Quantity': '5',
+          'Unit': 'NOS',
+          'Rate': '300',
+          'Item Amount': '1500',
+          'Discount %': '10',
+          'Taxable Value': '1350',
+          'HSN/SAC': '8518',
+          'Party GSTIN': '27ABCDE1234F1Z5',
+          'Party Address 1': '123 Business Lane',
+          'Party Address 2': 'Industrial Park',
+          'Party State': 'Maharashtra',
+          'Place of Supply': 'Maharashtra',
+          'Dispatch Date': '',
+          'Delivery Note No': '',
+          'Dispatch Doc No': '',
+          'Bilty LR No': '',
+          'Transporter Name': '',
+          'Transporter GSTIN': '',
+          'Vehicle No': '',
+          'Destination': '',
+          'Mode of Transport': '',
+          'Eway Bill No': '',
+          'GST Mode': 'Auto',
+          'GST Rate %': '12',
+          'CGST Ledger': 'CGST Output 6%',
+          'CGST Amount': '',
+          'SGST Ledger': 'SGST Output 6%',
+          'SGST Amount': '',
+          'IGST Ledger': '',
+          'IGST Amount': '',
+          'Freight Ledger': '',
+          'Freight Amount': '',
+          'Packing Ledger': '',
+          'Packing Amount': '',
+          'Loading Ledger': '',
+          'Loading Amount': '',
+          'Insurance Ledger': '',
+          'Insurance Amount': '',
+          'Other Ledger 1': '',
+          'Other Amount 1': '',
+          'Other Ledger 2': '',
+          'Other Amount 2': '',
+          'Discount Ledger': '',
+          'Bill Discount Amount': '',
+          'Round Off Ledger': '',
+          'Round Off Amount': '',
+          'Narration': '',
+          'Reference': ''
+        }
+      ];
+
+      const wb = new ExcelJS.Workbook();
+      const templateSheet = wb.addWorksheet('Template');
+      templateSheet.getRow(1).values = headers;
+      sampleData.forEach(row => {
+        const rowValues = headers.map(h => row[h as keyof typeof row] !== undefined ? row[h as keyof typeof row] : '');
+        templateSheet.addRow(rowValues);
+      });
+
+      // Prepare lists
+      const voucherTypes = ['Sales', 'Purchase'];
+      const ledgersList = (tallyContext && tallyContext.ledgers && tallyContext.ledgers.length > 0)
+        ? tallyContext.ledgers
+        : DEFAULT_LEDGERS;
+
+      const salesPurchaseLedgers = ledgersList.filter(l => 
+        l.toLowerCase().includes('sale') || 
+        l.toLowerCase().includes('purchase') || 
+        l.toLowerCase().includes('account') ||
+        l.toLowerCase().includes('a/c')
+      );
+      const finalSalesPurchaseLedgers = salesPurchaseLedgers.length > 0 ? salesPurchaseLedgers : ledgersList;
+
+      const stockList = (tallyContext && tallyContext.stockItems && tallyContext.stockItems.length > 0)
+        ? tallyContext.stockItems
+        : ['Sample Stock Item', 'Another Stock Item'];
+
+      const unitsList = (tallyContext && tallyContext.units && tallyContext.units.length > 0)
+        ? tallyContext.units
+        : DEFAULT_UNITS;
+
+      const gstLedgers = ledgersList.filter(l => 
+        l.toLowerCase().includes('cgst') || 
+        l.toLowerCase().includes('sgst') || 
+        l.toLowerCase().includes('igst') || 
+        l.toLowerCase().includes('utgst') || 
+        l.toLowerCase().includes('tax') || 
+        l.toLowerCase().includes('duty') || 
+        l.toLowerCase().includes('gst')
+      );
+      const finalGstLedgers = gstLedgers.length > 0 ? gstLedgers : ledgersList;
+
+      const finalAdditionalLedgers = ledgersList;
+
+      const roundOffLedgers = ledgersList.filter(l => l.toLowerCase().includes('round'));
+      const finalRoundOffLedgers = roundOffLedgers.length > 0 ? roundOffLedgers : ledgersList;
+
+      const finalStates = [
+        'Andhra Pradesh', 'Arunachal Pradesh', 'Assam', 'Bihar', 'Chhattisgarh',
+        'Goa', 'Gujarat', 'Haryana', 'Himachal Pradesh', 'Jharkhand', 'Karnataka',
+        'Kerala', 'Madhya Pradesh', 'Maharashtra', 'Manipur', 'Meghalaya', 'Mizoram',
+        'Nagaland', 'Odisha', 'Punjab', 'Rajasthan', 'Sikkim', 'Tamil Nadu',
+        'Telangana', 'Tripura', 'Uttar Pradesh', 'Uttarakhand', 'West Bengal',
+        'Andaman and Nicobar Islands', 'Chandigarh', 'Dadra and Nagar Haveli and Daman and Diu',
+        'Delhi', 'Jammu and Kashmir', 'Ladakh', 'Lakshadweep', 'Puducherry'
+      ];
+
+      const finalTransportModes = ['Road', 'Rail', 'Air', 'Ship'];
+
+      // Hidden masters sheet
+      const mastersSheet = wb.addWorksheet('Tally_Masters');
+      mastersSheet.state = 'hidden';
+      mastersSheet.getRow(1).values = [
+        'Voucher_Type',
+        'Party_Ledger',
+        'Sales_Purchase_Ledger',
+        'Stock_Item',
+        'Unit',
+        'GST_Ledgers',
+        'Additional_Ledgers',
+        'Round_Off_Ledgers',
+        'Place_of_Supply',
+        'Mode_of_Transport'
+      ];
+
+      const maxRows = Math.max(
+        voucherTypes.length,
+        ledgersList.length,
+        finalSalesPurchaseLedgers.length,
+        stockList.length,
+        unitsList.length,
+        finalGstLedgers.length,
+        finalAdditionalLedgers.length,
+        finalRoundOffLedgers.length,
+        finalStates.length,
+        finalTransportModes.length
+      );
+
+      for (let i = 0; i < maxRows; i++) {
+        mastersSheet.getRow(i + 2).values = [
+          voucherTypes[i] || '',
+          ledgersList[i] || '',
+          finalSalesPurchaseLedgers[i] || '',
+          stockList[i] || '',
+          unitsList[i] || '',
+          finalGstLedgers[i] || '',
+          finalAdditionalLedgers[i] || '',
+          finalRoundOffLedgers[i] || '',
+          finalStates[i] || '',
+          finalTransportModes[i] || ''
+        ];
+      }
+
+      // Apply validations
+      for (let r = 2; r <= 100; r++) {
+        // C: Voucher Type -> Col A of Tally_Masters
+        templateSheet.getCell(`C${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$A$2:$A$${voucherTypes.length + 1}`]
+        };
+        // D: Party Ledger -> Col B of Tally_Masters
+        templateSheet.getCell(`D${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$B$2:$B$${ledgersList.length + 1}`]
+        };
+        // E: Sales/Purchase Ledger -> Col C of Tally_Masters
+        templateSheet.getCell(`E${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$C$2:$C$${finalSalesPurchaseLedgers.length + 1}`]
+        };
+        // F: Stock Item -> Col D of Tally_Masters
+        templateSheet.getCell(`F${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$D$2:$D$${stockList.length + 1}`]
+        };
+        // I: Unit -> Col E of Tally_Masters
+        templateSheet.getCell(`I${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$E$2:$E$${unitsList.length + 1}`]
+        };
+        // R: Party State -> Col I of Tally_Masters
+        templateSheet.getCell(`R${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$I$2:$I$${finalStates.length + 1}`]
+        };
+        // S: Place of Supply -> Col I of Tally_Masters
+        templateSheet.getCell(`S${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$I$2:$I$${finalStates.length + 1}`]
+        };
+        // AB: Mode of Transport -> Col J of Tally_Masters
+        templateSheet.getCell(`AB${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$J$2:$J$${finalTransportModes.length + 1}`]
+        };
+        // AD: GST Mode -> Auto, Manual
+        templateSheet.getCell(`AD${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: ['"Auto,Manual"']
+        };
+        // AF: CGST Ledger -> Col F of Tally_Masters
+        templateSheet.getCell(`AF${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$F$2:$F$${finalGstLedgers.length + 1}`]
+        };
+        // AH: SGST Ledger -> Col F of Tally_Masters
+        templateSheet.getCell(`AH${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$F$2:$F$${finalGstLedgers.length + 1}`]
+        };
+        // AJ: IGST Ledger -> Col F of Tally_Masters
+        templateSheet.getCell(`AJ${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$F$2:$F$${finalGstLedgers.length + 1}`]
+        };
+        // AL: Freight Ledger -> Col G of Tally_Masters
+        templateSheet.getCell(`AL${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
+        };
+        // AN: Packing Ledger -> Col G of Tally_Masters
+        templateSheet.getCell(`AN${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
+        };
+        // AP: Loading Ledger -> Col G of Tally_Masters
+        templateSheet.getCell(`AP${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
+        };
+        // AR: Insurance Ledger -> Col G of Tally_Masters
+        templateSheet.getCell(`AR${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
+        };
+        // AT: Other Ledger 1 -> Col G of Tally_Masters
+        templateSheet.getCell(`AT${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
+        };
+        // AV: Other Ledger 2 -> Col G of Tally_Masters
+        templateSheet.getCell(`AV${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
+        };
+        // AX: Discount Ledger -> Col G of Tally_Masters
+        templateSheet.getCell(`AX${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
+        };
+        // AZ: Round Off Ledger -> Col H of Tally_Masters
+        templateSheet.getCell(`AZ${r}`).dataValidation = {
+          type: 'list',
+          allowBlank: true,
+          formulae: [`Tally_Masters!$H$2:$H$${finalRoundOffLedgers.length + 1}`]
+        };
+      }
+
+      const buffer = await wb.xlsx.writeBuffer();
+      const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Tally_${type}_Invoice_Template.xlsx`;
+      a.click();
+      window.URL.revokeObjectURL(url);
+      return;
+    }
+
     const headers = ['Date', 'Particulars', 'Voucher Type', 'Voucher No', 'Amount', 'Narration', 'Reference'];
     const sampleData = [
       {
@@ -471,10 +1347,48 @@ export default function App() {
       }
     ];
 
-    const ws = XLSX.utils.json_to_sheet(sampleData, { header: headers });
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Template");
-    XLSX.writeFile(wb, `Tally_${type}_Template.xlsx`);
+    const wb = new ExcelJS.Workbook();
+    const templateSheet = wb.addWorksheet('Template');
+    templateSheet.getRow(1).values = headers;
+    sampleData.forEach(row => {
+      const rowValues = headers.map(h => row[h as keyof typeof row] !== undefined ? row[h as keyof typeof row] : '');
+      templateSheet.addRow(rowValues);
+    });
+
+    const ledgersList = (tallyContext && tallyContext.ledgers && tallyContext.ledgers.length > 0)
+      ? tallyContext.ledgers
+      : DEFAULT_LEDGERS;
+
+    const mastersSheet = wb.addWorksheet('Tally_Masters');
+    mastersSheet.state = 'hidden';
+    mastersSheet.getRow(1).values = ['Ledgers'];
+    ledgersList.forEach((l, idx) => {
+      mastersSheet.getRow(idx + 2).values = [l];
+    });
+
+    for (let r = 2; r <= 100; r++) {
+      // B: Particulars -> Col A of Tally_Masters
+      templateSheet.getCell(`B${r}`).dataValidation = {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$A$2:$A$${ledgersList.length + 1}`]
+      };
+      // C: Voucher Type -> list
+      templateSheet.getCell(`C${r}`).dataValidation = {
+        type: 'list',
+        allowBlank: true,
+        formulae: ['"Payment,Receipt,Contra,Journal"']
+      };
+    }
+
+    const buffer = await wb.xlsx.writeBuffer();
+    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `Tally_${type}_Template.xlsx`;
+    a.click();
+    window.URL.revokeObjectURL(url);
   };
 
   const downloadMasterTemplate = (type: string) => {
@@ -554,6 +1468,70 @@ export default function App() {
     const ws = XLSX.utils.json_to_sheet(sampleData, { header: headers });
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, sheetName);
+
+    if (type === 'Ledger') {
+      const groupsList = (tallyContext && tallyContext.groups && tallyContext.groups.length > 0)
+        ? tallyContext.groups
+        : DEFAULT_GROUPS;
+
+      const mastersWS = buildMastersSheet({ 'Groups': groupsList });
+      XLSX.utils.book_append_sheet(wb, mastersWS, "Tally_Masters");
+
+      ws['!dataValidation'] = [
+        {
+          sqref: 'B2:B100',
+          type: 'list',
+          allowBlank: true,
+          formula1: `Tally_Masters!$A$2:$A$${groupsList.length + 1}`
+        }
+      ];
+    } else if (type === 'StockItem') {
+      const stockGroupsList = (tallyContext && tallyContext.stockGroups && tallyContext.stockGroups.length > 0)
+        ? tallyContext.stockGroups
+        : DEFAULT_STOCK_GROUPS;
+
+      const unitsList = (tallyContext && tallyContext.units && tallyContext.units.length > 0)
+        ? tallyContext.units
+        : DEFAULT_UNITS;
+
+      const mastersWS = buildMastersSheet({
+        'StockGroups': stockGroupsList,
+        'Units': unitsList
+      });
+      XLSX.utils.book_append_sheet(wb, mastersWS, "Tally_Masters");
+
+      ws['!dataValidation'] = [
+        {
+          sqref: 'B2:B100',
+          type: 'list',
+          allowBlank: true,
+          formula1: `Tally_Masters!$A$2:$A$${stockGroupsList.length + 1}`
+        },
+        {
+          sqref: 'C2:C100',
+          type: 'list',
+          allowBlank: true,
+          formula1: `Tally_Masters!$B$2:$B$${unitsList.length + 1}`
+        }
+      ];
+    } else if (type === 'StockGroup') {
+      const stockGroupsList = (tallyContext && tallyContext.stockGroups && tallyContext.stockGroups.length > 0)
+        ? tallyContext.stockGroups
+        : DEFAULT_STOCK_GROUPS;
+
+      const mastersWS = buildMastersSheet({ 'StockGroups': stockGroupsList });
+      XLSX.utils.book_append_sheet(wb, mastersWS, "Tally_Masters");
+
+      ws['!dataValidation'] = [
+        {
+          sqref: 'B2:B100',
+          type: 'list',
+          allowBlank: true,
+          formula1: `Tally_Masters!$A$2:$A$${stockGroupsList.length + 1}`
+        }
+      ];
+    }
+
     XLSX.writeFile(wb, `Tally_${type}_Template.xlsx`);
   };
 
@@ -751,6 +1729,8 @@ export default function App() {
     const ledgerGroupMap: Record<string, string> = {};
     const stockItemStockGroupMap: Record<string, string> = {};
     const groupParentMap: Record<string, string> = {};
+    const ledgerDetails: LedgerMasterRow[] = [];
+    const stockItemDetails: StockMasterRow[] = [];
 
     const getParentName = (obj: any): string => {
       if (!obj) return '';
@@ -766,7 +1746,7 @@ export default function App() {
 
       if (obj.LEDGER) {
         const list = Array.isArray(obj.LEDGER) ? obj.LEDGER : [obj.LEDGER];
-        list.forEach((l: any) => {
+        list.forEach((l: any, idx: number) => {
           const name = l['@_NAME'] || l.NAME;
           if (name) {
             const nameStr = String(name);
@@ -774,6 +1754,40 @@ export default function App() {
             const parent = l.PARENT || l['@_PARENT'];
             const parentStr = getParentName(parent);
             if (parentStr) ledgerGroupMap[nameStr] = parentStr;
+
+            const registrationType = String(l.GSTREGISTRATIONTYPE || l['@_GSTREGISTRATIONTYPE'] || l.REGISTRATIONTYPE || '').trim();
+            const gstin = String(l.PARTYGSTIN || l['@_PARTYGSTIN'] || l.GSTIN || l['@_GSTIN'] || '').trim();
+            const state = String(l.STATENAME || l['@_STATENAME'] || l.STATE || '').trim();
+            
+            let address1 = '';
+            let address2 = '';
+            if (l.ADDRESS) {
+              const addrList = Array.isArray(l.ADDRESS) ? l.ADDRESS : [l.ADDRESS];
+              const resolvedLines: string[] = addrList.map((addr: any) => {
+                if (typeof addr === 'string') return addr;
+                if (typeof addr === 'object' && addr) return addr['#text'] || '';
+                return '';
+              }).filter(Boolean);
+              address1 = resolvedLines[0] || '';
+              address2 = resolvedLines[1] || resolvedLines.slice(1).join(', ') || '';
+            }
+
+            ledgerDetails.push({
+              rowNum: idx + 1,
+              ledgerName: nameStr,
+              underGroup: parentStr || 'Sundry Debtors',
+              address1,
+              address2,
+              state,
+              gstin,
+              registrationType,
+              isValid: true,
+              errors: [],
+              warnings: [],
+              isDuplicate: false,
+              isPossibleDuplicate: false,
+              excluded: false
+            });
           }
         });
       }
@@ -801,12 +1815,58 @@ export default function App() {
       }
       if (obj.STOCKITEM) {
         const list = Array.isArray(obj.STOCKITEM) ? obj.STOCKITEM : [obj.STOCKITEM];
-        list.forEach((si: any) => {
+        list.forEach((si: any, idx: number) => {
           const name = si['@_NAME'] || si.NAME;
           if (name) {
             const nameStr = String(name);
             stockItems.push(nameStr);
-            if (si.PARENT) stockItemStockGroupMap[nameStr] = String(si.PARENT);
+            const parentGroup = si.PARENT ? String(si.PARENT) : '';
+            if (parentGroup) stockItemStockGroupMap[nameStr] = parentGroup;
+
+            const unit = String(si.BASEUNITS || si['@_BASEUNITS'] || si.UNIT || 'NOS').trim();
+            
+            // Recursive key finder helper
+            const findKeyInObject = (o: any, keyName: string): any => {
+              if (!o) return undefined;
+              if (typeof o !== 'object') return undefined;
+              if (o[keyName] !== undefined) return o[keyName];
+              for (const k of Object.keys(o)) {
+                const val = o[k];
+                if (typeof val === 'object') {
+                  const found = findKeyInObject(val, keyName);
+                  if (found !== undefined) return found;
+                }
+              }
+              return undefined;
+            };
+
+            const hsn = String(findKeyInObject(si, 'HSNCODE') || findKeyInObject(si, 'HSN') || findKeyInObject(si, 'GSTHSNNAME') || '').trim();
+            let gstRateVal = '';
+            const rateFound = findKeyInObject(si, 'GSTRATE') || findKeyInObject(si, 'RATE');
+            if (rateFound !== undefined) {
+              if (typeof rateFound === 'string') {
+                gstRateVal = rateFound;
+              } else if (typeof rateFound === 'number') {
+                gstRateVal = String(rateFound);
+              } else if (typeof rateFound === 'object' && rateFound) {
+                gstRateVal = rateFound['#text'] || '';
+              }
+            }
+
+            stockItemDetails.push({
+              rowNum: idx + 1,
+              itemName: nameStr,
+              underGroup: parentGroup,
+              unit,
+              hsn,
+              gstRate: gstRateVal,
+              isValid: true,
+              errors: [],
+              warnings: [],
+              isDuplicate: false,
+              isPossibleDuplicate: false,
+              excluded: false
+            });
           }
         });
       }
@@ -836,6 +1896,8 @@ export default function App() {
       ledgerGroupMap,
       stockItemStockGroupMap,
       groupParentMap,
+      ledgerDetails,
+      stockItemDetails,
     };
   };
 
@@ -868,7 +1930,9 @@ export default function App() {
           ledgerGroupMap: parsed.ledgerGroupMap,
           stockItemStockGroupMap: parsed.stockItemStockGroupMap,
           groupParentMap: parsed.groupParentMap || {},
-          historicalMappings: existingMappings
+          historicalMappings: existingMappings,
+          ledgerDetails: parsed.ledgerDetails || [],
+          stockItemDetails: parsed.stockItemDetails || [],
         };
         if (getAppMode() === 'web') {
           contextPayload.lastUpdated = serverTimestamp();
@@ -961,7 +2025,9 @@ export default function App() {
           ledgerGroupMap: currentLedgerGroupMap,
           stockItemStockGroupMap: currentStockItemStockGroupMap,
           groupParentMap: currentGroupParentMap,
-          historicalMappings: mergedHistorical
+          historicalMappings: mergedHistorical,
+          ledgerDetails: tallyContext?.ledgerDetails || [],
+          stockItemDetails: tallyContext?.stockItemDetails || [],
         };
         if (getAppMode() === 'web') {
           contextPayload.lastUpdated = serverTimestamp();
@@ -1072,7 +2138,9 @@ export default function App() {
       ledgerGroupMap,
       stockItemStockGroupMap,
       groupParentMap,
-      historicalMappings: historicalMappings.slice(0, 500)
+      historicalMappings: historicalMappings.slice(0, 500),
+      ledgerDetails: tallyContext?.ledgerDetails || [],
+      stockItemDetails: tallyContext?.stockItemDetails || [],
     };
     if (getAppMode() === 'web') {
       contextPayload.lastUpdated = serverTimestamp();
@@ -1652,71 +2720,32 @@ export default function App() {
         throw new Error(`Row ${missingLedgerRow.rowNo} has no Particulars Ledger selected. Please select a ledger.`);
       }
 
-      const conversionPayload: any = {
-        fileName: pendingFileName,
-        voucherType: 'Voucher',
-        status: 'processing',
-        bankLedger: selectedBankLedger
-      };
-      if (getAppMode() === 'web') {
-        conversionPayload.timestamp = serverTimestamp();
-      }
-      const conversionId = await saveConversion(user?.uid || OFFLINE_USER.uid, conversionPayload);
-
-      const vouchers: TallyVoucher[] = validRows.map(row => {
+      const rows = validRows.map(row => {
         const dateNorm = normalizeTallyDate(row.date);
         if (!dateNorm.isValid) {
           throw new Error(`Row ${row.rowNo}: Date "${row.date}" could not be parsed: ${dateNorm.error}`);
         }
-
         const vType = row.detectedVoucherType === 'Unknown' ? 'Payment' : row.detectedVoucherType;
-
-        const voucher: TallyVoucher = {
-          date: dateNorm.value,
+        return {
+          rowNo: row.rowNo,
           voucherType: vType,
-          partyName: row.userLedger,
-          voucherNumber: undefined,
-          narration: row.description || undefined,
-          reference: row.reference || undefined,
-          ledgerEntries: []
+          originalDate: row.date,
+          normalizedDate: dateNorm.value,
+          finalLedger: row.userLedger,
+          bankLedger: selectedBankLedger || 'Bank Account',
+          amount: row.amount,
+          description: row.description || '',
+          reference: row.reference || '',
+          sourceIdx: bankStatementRows.indexOf(row),
         };
-
-        const isPartyPositive = vType === 'Payment' ? 'Yes' : 'No';
-        voucher.ledgerEntries.push({
-          ledgerName: row.userLedger,
-          isDeemedPositive: isPartyPositive,
-          amount: Math.abs(row.amount)
-        });
-
-        const isBankPositive = vType === 'Payment' ? 'No' : 'Yes';
-        voucher.ledgerEntries.push({
-          ledgerName: selectedBankLedger,
-          isDeemedPositive: isBankPositive,
-          amount: Math.abs(row.amount)
-        });
-
-        return voucher;
       });
 
-      const xml = generateTallyXML(vouchers);
-      await updateConversion(user?.uid || OFFLINE_USER.uid, conversionId, {
-        status: 'completed',
-        xmlContent: xml
-      });
-
-      const newRecord: ConversionRecord = {
-        id: conversionId,
-        fileName: pendingFileName,
-        timestamp: { seconds: Math.floor(Date.now() / 1000) },
-        status: 'completed',
-        xmlContent: xml,
-        voucherType: 'Voucher'
-      };
-      setConversions(prev => [newRecord, ...prev]);
-      setCurrentStep('complete');
+      setVerificationRows(rows);
+      setVerificationSourceStep('bank-statement-review');
+      setCurrentStep('verification');
       setIsProcessing(false);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Conversion failed");
+      setError(err instanceof Error ? err.message : "Verification failed");
       setIsProcessing(false);
     }
   };
@@ -2087,6 +3116,21 @@ export default function App() {
 
             // Get all unique keys from all rows to ensure we don't miss any headers
             const headers = Array.from(new Set(jsonData.flatMap(row => Object.keys(row as object))));
+
+            const isSalesPurchase = headers.some(h => {
+              const hLower = h.toLowerCase().trim();
+              return hLower.includes('stock item') || hLower.includes('invoice no') || hLower.includes('party ledger') || hLower.includes('sales/purchase ledger');
+            });
+
+            if (isSalesPurchase) {
+              const invoices = processSalesPurchaseExcel(jsonData);
+              invoices.forEach(inv => recalculateInvoice(inv, companyState));
+              setSalesPurchaseInvoices(invoices);
+              setCurrentStep('sales-purchase-verification');
+              setIsProcessing(false);
+              return;
+            }
+
             setPendingData(jsonData);
 
             // Get AI Column Mapping FIRST
@@ -2734,18 +3778,7 @@ export default function App() {
     setError(null);
 
     try {
-      const conversionPayload: any = {
-        fileName: pendingFileName,
-        status: 'processing',
-        voucherType: selectedVoucherType,
-        bankLedger: selectedBankLedger
-      };
-      if (getAppMode() === 'web') {
-        conversionPayload.timestamp = serverTimestamp();
-      }
-      const conversionId = await saveConversion(user.uid, conversionPayload);
-
-      const vouchers: TallyVoucher[] = pendingData.map((row: any, rowIndex: number) => {
+      const rows = pendingData.map((row: any, rowIndex: number) => {
         let dateVal: any = undefined;
         let partyNameVal = '';
         let voucherNumberVal = '';
@@ -2800,43 +3833,100 @@ export default function App() {
           throw new Error(`Row ${rowIndex + 1}: Particulars / Party Ledger is blank or unmapped. Please select or provide a valid ledger.`);
         }
 
-        const voucher: TallyVoucher = {
-          date: dateNorm.value,
+        return {
+          rowNo: rowIndex + 1,
           voucherType: selectedVoucherType,
-          partyName: partyNameVal,
-          voucherNumber: voucherNumberVal || undefined,
-          narration: narrationVal || undefined,
-          reference: referenceVal || undefined,
+          originalDate: String(dateVal || ''),
+          normalizedDate: dateNorm.value,
+          finalLedger: partyNameVal,
+          bankLedger: selectedBankLedger || 'Bank Account',
+          amount: amountVal,
+          description: narrationVal,
+          reference: referenceVal,
+          voucherNumber: voucherNumberVal,
+          sourceIdx: rowIndex,
+        };
+      });
+
+      setVerificationRows(rows);
+      setVerificationSourceStep('mapping');
+      setCurrentStep('verification');
+      setIsProcessing(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Verification failed");
+      setIsProcessing(false);
+    }
+  };
+
+  const generateFinalXMLFromVerification = async () => {
+    if (!user || verificationRows.length === 0) return;
+    setIsProcessing(true);
+    setError(null);
+
+    try {
+      const conversionPayload: any = {
+        fileName: pendingFileName,
+        status: 'processing',
+        voucherType: 'Voucher'
+      };
+      if (getAppMode() === 'web') {
+        conversionPayload.timestamp = serverTimestamp();
+      }
+      const conversionId = await saveConversion(user.uid, conversionPayload);
+
+      const vouchers: TallyVoucher[] = verificationRows.map(row => {
+        const vType = row.voucherType;
+        const amt = Math.abs(row.amount);
+
+        const voucher: TallyVoucher = {
+          date: row.normalizedDate,
+          voucherType: vType,
+          partyName: row.finalLedger,
+          bankLedger: row.bankLedger,
+          voucherNumber: row.voucherNumber || undefined,
+          narration: row.description || undefined,
+          reference: row.reference || undefined,
           ledgerEntries: []
         };
 
-        voucher.ledgerEntries.push({
-          ledgerName: voucher.partyName,
-          isDeemedPositive: amountVal > 0 ? 'Yes' : 'No',
-          amount: Math.abs(amountVal)
-        });
+        if (vType === 'Receipt') {
+          // Receipt sign logic:
+          // Final Ledger: ISDEEMEDPOSITIVE = No, AMOUNT is positive (+Amount)
+          // Bank Ledger: ISDEEMEDPOSITIVE = Yes, AMOUNT is negative (-Amount)
+          voucher.ledgerEntries.push({
+            ledgerName: row.finalLedger,
+            isDeemedPositive: 'No',
+            isLastDeemedPositive: 'No',
+            isPartyLedger: 'No',
+            amount: amt
+          });
 
-        if (voucher.ledgerEntries.length === 1) {
-          const mainEntry = voucher.ledgerEntries[0];
-          
-          // Logic for Receipt: Bank is Debited (Positive), Mapped Account is Credited (Negative)
-          // Logic for Payment: Bank is Credited (Negative), Mapped Account is Debited (Positive)
-          if (selectedVoucherType === 'Receipt') {
-            mainEntry.isDeemedPositive = 'No'; // Credit the mapped account
-            voucher.ledgerEntries.push({
-              ledgerName: selectedBankLedger || 'Bank Account',
-              isDeemedPositive: 'Yes', // Debit the bank
-              amount: mainEntry.amount
-            });
-          } else {
-            // Default (Payment) logic
-            mainEntry.isDeemedPositive = 'Yes'; // Debit the mapped account
-            voucher.ledgerEntries.push({
-              ledgerName: selectedBankLedger || 'Bank Account',
-              isDeemedPositive: 'No', // Credit the bank
-              amount: mainEntry.amount
-            });
-          }
+          voucher.ledgerEntries.push({
+            ledgerName: row.bankLedger || selectedBankLedger || 'Bank Account',
+            isDeemedPositive: 'Yes',
+            isLastDeemedPositive: 'Yes',
+            isPartyLedger: 'Yes',
+            amount: -amt
+          });
+        } else {
+          // Payment sign logic:
+          // Final Ledger: ISDEEMEDPOSITIVE = Yes, AMOUNT is negative (-Amount)
+          // Bank Ledger: ISDEEMEDPOSITIVE = No, AMOUNT is positive (+Amount)
+          voucher.ledgerEntries.push({
+            ledgerName: row.finalLedger,
+            isDeemedPositive: 'Yes',
+            isLastDeemedPositive: 'Yes',
+            isPartyLedger: 'No',
+            amount: -amt
+          });
+
+          voucher.ledgerEntries.push({
+            ledgerName: row.bankLedger || selectedBankLedger || 'Bank Account',
+            isDeemedPositive: 'No',
+            isLastDeemedPositive: 'No',
+            isPartyLedger: 'Yes',
+            amount: amt
+          });
         }
 
         return voucher;
@@ -2848,6 +3938,62 @@ export default function App() {
         xmlContent: xml
       });
 
+      const newRecord: ConversionRecord = {
+        id: conversionId,
+        fileName: pendingFileName,
+        timestamp: { seconds: Math.floor(Date.now() / 1000) },
+        status: 'completed',
+        xmlContent: xml,
+        voucherType: 'Voucher'
+      };
+
+      setConversions(prev => [newRecord, ...prev]);
+      setCurrentStep('complete');
+      setIsProcessing(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Conversion failed");
+      setIsProcessing(false);
+    }
+  };
+
+  const generateSalesPurchaseXMLFromVerification = async () => {
+    if (!user || salesPurchaseInvoices.length === 0) return;
+    setIsProcessing(true);
+    setError(null);
+
+    try {
+      const errorInvoice = salesPurchaseInvoices.find(inv => !inv.isValid);
+      if (errorInvoice) {
+        throw new Error(`Invoice No "${errorInvoice.invoiceNo}" has errors. Please fix all errors before generating XML.`);
+      }
+
+      const conversionPayload: any = {
+        fileName: pendingFileName,
+        status: 'processing',
+        voucherType: 'SalesPurchase'
+      };
+      if (getAppMode() === 'web') {
+        conversionPayload.timestamp = serverTimestamp();
+      }
+      const conversionId = await saveConversion(user.uid, conversionPayload);
+
+      const xml = generateSalesPurchaseXML(salesPurchaseInvoices, companyState);
+
+      await updateConversion(user.uid, conversionId, {
+        status: 'completed',
+        xmlContent: xml
+      });
+
+      const newRecord: ConversionRecord = {
+        id: conversionId,
+        fileName: pendingFileName,
+        timestamp: { seconds: Math.floor(Date.now() / 1000) },
+        status: 'completed',
+        xmlContent: xml,
+        voucherType: 'SalesPurchase'
+      };
+
+      setConversions(prev => [newRecord, ...prev]);
       setCurrentStep('complete');
       setIsProcessing(false);
     } catch (err) {
@@ -3485,7 +4631,7 @@ export default function App() {
                                 className="p-4 bg-zinc-50 rounded-xl border border-zinc-200/60 mt-3 flex flex-wrap gap-2 items-center"
                               >
                                 <span className="text-xs font-bold text-zinc-600 block mr-2">Download Template:</span>
-                                {['Payment', 'Receipt', 'Contra', 'Journal'].map(type => (
+                                {['Payment', 'Receipt', 'Contra', 'Journal', 'Sales', 'Purchase'].map(type => (
                                   <button
                                     key={type}
                                     type="button"
@@ -5115,6 +6261,1095 @@ export default function App() {
                 </motion.section>
               )}
 
+              {currentStep === 'verification' && (
+                <motion.section
+                  key="verification"
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -10 }}
+                  className="bg-white p-6 rounded-2xl border border-zinc-200 shadow-sm space-y-6"
+                >
+                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-zinc-100 pb-5">
+                    <div>
+                      <h2 className="text-xl font-bold flex items-center gap-2 text-zinc-900">
+                        <CheckCircle2 className="w-5 h-5 text-emerald-600" />
+                        Step 3: Verification Screen Before XML
+                      </h2>
+                      <p className="text-xs text-zinc-500 mt-1 leading-relaxed">
+                        Review the precise debit/credit sign logic, amounts, and ledger mappings. You can correct the ledgers here before generating the final XML.
+                      </p>
+                    </div>
+                    <div className="text-right">
+                      <span className="text-xs bg-emerald-50 text-emerald-700 border border-emerald-100 px-3 py-1.5 rounded-lg font-bold">
+                        {verificationRows.length} Transactions Ready
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Table Container */}
+                  <div className="border border-zinc-200 rounded-xl overflow-hidden bg-white">
+                    <div className="max-h-[500px] overflow-y-auto">
+                      <table className="w-full border-collapse text-left text-xs">
+                        <thead>
+                          <tr className="bg-zinc-50 border-b border-zinc-200 font-bold text-zinc-700">
+                            <th className="p-3 w-16 text-center">Row</th>
+                            <th className="p-3 w-28">Voucher Type</th>
+                            <th className="p-3 w-40">Date (Original → Tally)</th>
+                            <th className="p-3">Ledger Entries & Sign Logic Preview</th>
+                            <th className="p-3 w-48">Reference / Narration</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-zinc-100">
+                          {verificationRows.map((row, idx) => {
+                            const isPayment = row.voucherType === 'Payment';
+                            const amtAbs = Math.abs(row.amount);
+                            const isSuspense = row.finalLedger && /suspense/i.test(row.finalLedger);
+
+                            return (
+                              <tr key={idx} className="hover:bg-zinc-50/50 transition-colors">
+                                <td className="p-3 text-center font-mono text-zinc-400">{row.rowNo}</td>
+                                <td className="p-3">
+                                  <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wide border ${
+                                    isPayment 
+                                      ? 'bg-rose-50 text-rose-700 border-rose-100' 
+                                      : 'bg-emerald-50 text-emerald-700 border-emerald-100'
+                                  }`}>
+                                    {row.voucherType}
+                                  </span>
+                                </td>
+                                <td className="p-3">
+                                  <div className="font-medium text-zinc-900">{row.originalDate}</div>
+                                  <div className="text-[10px] font-mono text-zinc-400 mt-0.5">Tally: {row.normalizedDate}</div>
+                                </td>
+                                <td className="p-3 space-y-2">
+                                  {/* Debit Leg */}
+                                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-2 bg-zinc-50/50 rounded-lg border border-zinc-100">
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-[10px] font-bold bg-zinc-200 text-zinc-700 px-1.5 py-0.5 rounded uppercase">Dr</span>
+                                      {tallyContext ? (
+                                        <select
+                                          value={isPayment ? row.finalLedger : row.bankLedger}
+                                          onChange={(e) => {
+                                            if (isPayment) {
+                                              updateVerificationRowLedger(idx, e.target.value);
+                                            } else {
+                                              const updated = [...verificationRows];
+                                              updated[idx].bankLedger = e.target.value;
+                                              setVerificationRows(updated);
+                                            }
+                                          }}
+                                          className="bg-transparent font-bold text-zinc-800 outline-none text-xs border border-zinc-200 rounded px-1.5 py-0.5 max-w-[200px]"
+                                        >
+                                          <option value="">-- Select Ledger --</option>
+                                          {tallyContext.ledgers.map(l => (
+                                            <option key={l} value={l}>{l}</option>
+                                          ))}
+                                        </select>
+                                      ) : (
+                                        <input
+                                          type="text"
+                                          value={isPayment ? row.finalLedger : row.bankLedger}
+                                          onChange={(e) => {
+                                            if (isPayment) {
+                                              updateVerificationRowLedger(idx, e.target.value);
+                                            } else {
+                                              const updated = [...verificationRows];
+                                              updated[idx].bankLedger = e.target.value;
+                                              setVerificationRows(updated);
+                                            }
+                                          }}
+                                          className="bg-transparent font-bold text-zinc-800 outline-none text-xs border border-zinc-200 rounded px-1.5 py-0.5"
+                                        />
+                                      )}
+                                      {isPayment && isSuspense && (
+                                        <span className="inline-flex items-center gap-1 bg-amber-50 text-amber-700 border border-amber-200 px-2 py-0.5 rounded text-[10px] font-bold animate-pulse">
+                                          ⚠️ Suspense
+                                        </span>
+                                      )}
+                                    </div>
+                                    <span className="font-mono text-xs font-semibold text-rose-600">
+                                      -{amtAbs.toFixed(2)}
+                                    </span>
+                                  </div>
+
+                                  {/* Credit Leg */}
+                                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-2 bg-zinc-50/50 rounded-lg border border-zinc-100">
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-[10px] font-bold bg-zinc-200 text-zinc-700 px-1.5 py-0.5 rounded uppercase">Cr</span>
+                                      {tallyContext ? (
+                                        <select
+                                          value={isPayment ? row.bankLedger : row.finalLedger}
+                                          onChange={(e) => {
+                                            if (!isPayment) {
+                                              updateVerificationRowLedger(idx, e.target.value);
+                                            } else {
+                                              const updated = [...verificationRows];
+                                              updated[idx].bankLedger = e.target.value;
+                                              setVerificationRows(updated);
+                                            }
+                                          }}
+                                          className="bg-transparent font-bold text-zinc-800 outline-none text-xs border border-zinc-200 rounded px-1.5 py-0.5 max-w-[200px]"
+                                        >
+                                          <option value="">-- Select Ledger --</option>
+                                          {tallyContext.ledgers.map(l => (
+                                            <option key={l} value={l}>{l}</option>
+                                          ))}
+                                        </select>
+                                      ) : (
+                                        <input
+                                          type="text"
+                                          value={isPayment ? row.bankLedger : row.finalLedger}
+                                          onChange={(e) => {
+                                            if (!isPayment) {
+                                              updateVerificationRowLedger(idx, e.target.value);
+                                            } else {
+                                              const updated = [...verificationRows];
+                                              updated[idx].bankLedger = e.target.value;
+                                              setVerificationRows(updated);
+                                            }
+                                          }}
+                                          className="bg-transparent font-bold text-zinc-800 outline-none text-xs border border-zinc-200 rounded px-1.5 py-0.5"
+                                        />
+                                      )}
+                                      {!isPayment && isSuspense && (
+                                        <span className="inline-flex items-center gap-1 bg-amber-50 text-amber-700 border border-amber-200 px-2 py-0.5 rounded text-[10px] font-bold animate-pulse">
+                                          ⚠️ Suspense
+                                        </span>
+                                      )}
+                                    </div>
+                                    <span className="font-mono text-xs font-semibold text-emerald-600">
+                                      +{amtAbs.toFixed(2)}
+                                    </span>
+                                  </div>
+                                </td>
+                                <td className="p-3 space-y-1">
+                                  {row.reference && (
+                                    <div className="font-medium text-zinc-900 flex items-center gap-1">
+                                      <span className="text-[9px] font-bold bg-zinc-100 text-zinc-600 px-1 py-0.2 rounded uppercase">Ref</span>
+                                      <span className="truncate max-w-[150px] font-mono">{row.reference}</span>
+                                    </div>
+                                  )}
+                                  <div className="text-zinc-500 text-[11px] leading-relaxed line-clamp-2">{row.description}</div>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  {/* Footer actions */}
+                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pt-4 border-t border-zinc-100">
+                    <div className="text-xs text-zinc-500">
+                      Review the voucher structure. Both credit and debit legs match perfectly in value. 
+                    </div>
+                    <div className="flex items-center gap-3 justify-end shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => setCurrentStep(verificationSourceStep)}
+                        className="px-5 py-3 hover:bg-zinc-100 border border-zinc-200 text-zinc-700 rounded-xl text-xs font-bold transition-all flex items-center gap-2"
+                      >
+                        <RotateCcw className="w-4 h-4" />
+                        Back to Edit
+                      </button>
+                      <button
+                        type="button"
+                        onClick={generateFinalXMLFromVerification}
+                        disabled={isProcessing}
+                        className="px-6 py-3 bg-zinc-900 hover:bg-zinc-850 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-2 disabled:opacity-50 shadow-sm"
+                      >
+                        {isProcessing ? (
+                          <>
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            Generating XML...
+                          </>
+                        ) : (
+                          <>
+                            <CheckCircle2 className="w-4 h-4" />
+                            Confirm & Generate Tally XML
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                </motion.section>
+              )}
+
+              {currentStep === 'sales-purchase-verification' && (() => {
+                const activeInv = salesPurchaseInvoices[selectedInvoiceIdx];
+                const ledgersList = tallyContext?.ledgers || DEFAULT_LEDGERS;
+                const stockItemsList = tallyContext?.stockItems || [];
+                const unitsList = tallyContext?.units || DEFAULT_UNITS;
+
+                return (
+                  <motion.section
+                    key="sales-purchase-verification"
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -10 }}
+                    className="bg-white p-6 rounded-2xl border border-zinc-200 shadow-sm space-y-6"
+                  >
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-zinc-100 pb-5">
+                      <div>
+                        <h2 className="text-xl font-bold flex items-center gap-2 text-zinc-900">
+                          <CheckCircle2 className="w-5 h-5 text-emerald-600" />
+                          Step 3: Verification of Sales / Purchase Invoices
+                        </h2>
+                        <p className="text-xs text-zinc-500 mt-1 leading-relaxed">
+                          Review item lines, verify auto GST calculations, modify ledgers/amounts, and fill transport details before exporting to Tally.
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <span className="text-xs bg-emerald-50 text-emerald-700 border border-emerald-100 px-3 py-1.5 rounded-lg font-bold">
+                          {salesPurchaseInvoices.length} Invoices Found
+                        </span>
+                        <span className="text-xs bg-amber-50 text-amber-700 border border-amber-100 px-3 py-1.5 rounded-lg font-bold">
+                          {salesPurchaseInvoices.filter(i => !i.isValid).length} Require Review
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+                      {/* Left Sidebar: Invoice list */}
+                      <div className="lg:col-span-1 space-y-3">
+                        <div className="p-3 bg-zinc-50 border border-zinc-200/60 rounded-xl mb-4 space-y-1.5">
+                          <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider block">Company State (GST Base)</label>
+                          <select
+                            value={companyState}
+                            onChange={(e) => {
+                              const newState = e.target.value;
+                              setCompanyState(newState);
+                              const updated = salesPurchaseInvoices.map(inv => {
+                                const copy = JSON.parse(JSON.stringify(inv));
+                                recalculateInvoice(copy, newState);
+                                return copy;
+                              });
+                              setSalesPurchaseInvoices(updated);
+                            }}
+                            className="w-full text-xs p-2 bg-white border border-zinc-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-zinc-900 font-medium"
+                          >
+                            {['Andaman and Nicobar Islands', 'Andhra Pradesh', 'Arunachal Pradesh', 'Assam', 'Bihar', 'Chandigarh', 'Chhattisgarh', 'Dadra and Nagar Haveli and Daman and Diu', 'Delhi', 'Goa', 'Gujarat', 'Haryana', 'Himachal Pradesh', 'Jammu and Kashmir', 'Jharkhand', 'Karnataka', 'Kerala', 'Ladakh', 'Lakshadweep', 'Madhya Pradesh', 'Maharashtra', 'Manipur', 'Meghalaya', 'Mizoram', 'Nagaland', 'Odisha', 'Puducherry', 'Punjab', 'Rajasthan', 'Sikkim', 'Tamil Nadu', 'Telangana', 'Tripura', 'Uttar Pradesh', 'Uttarakhand', 'West Bengal'].map(st => (
+                              <option key={st} value={st}>{st}</option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div className="max-h-[600px] overflow-y-auto space-y-2 pr-1">
+                          {salesPurchaseInvoices.map((inv, idx) => {
+                            const isSelected = selectedInvoiceIdx === idx;
+                            return (
+                              <button
+                                key={idx}
+                                type="button"
+                                onClick={() => setSelectedInvoiceIdx(idx)}
+                                className={`w-full text-left p-3.5 rounded-xl border-2 transition-all flex flex-col gap-1.5 ${
+                                  isSelected
+                                    ? 'border-zinc-900 bg-zinc-50'
+                                    : 'border-zinc-100 hover:border-zinc-300 bg-white'
+                                }`}
+                              >
+                                <div className="flex items-center justify-between gap-1">
+                                  <span className="font-mono text-xs font-bold truncate text-zinc-900 max-w-[110px]">
+                                    #{inv.invoiceNo || 'No No'}
+                                  </span>
+                                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                                    inv.voucherType === 'Sales' ? 'bg-indigo-50 text-indigo-700' : 'bg-amber-50 text-amber-700'
+                                  }`}>
+                                    {inv.voucherType}
+                                  </span>
+                                </div>
+                                <div className="flex justify-between items-center text-[11px] text-zinc-500">
+                                  <span>{inv.invoiceDate}</span>
+                                  <span className="font-semibold text-zinc-800">
+                                    ₹{inv.invoiceTotal.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                  </span>
+                                </div>
+                                <div className="text-[10px] text-zinc-400 truncate max-w-full">
+                                  {inv.partyLedger || 'No Party'}
+                                </div>
+                                {inv.errors.length > 0 ? (
+                                  <span className="text-[9px] text-red-600 font-bold bg-red-50/50 px-1.5 py-0.5 rounded flex items-center gap-1 mt-1">
+                                    ⚠️ {inv.errors.length} errors
+                                  </span>
+                                ) : inv.warnings.length > 0 ? (
+                                  <span className="text-[9px] text-amber-600 font-bold bg-amber-50/50 px-1.5 py-0.5 rounded flex items-center gap-1 mt-1">
+                                    ⚠️ {inv.warnings.length} warnings
+                                  </span>
+                                ) : (
+                                  <span className="text-[9px] text-emerald-700 font-bold bg-emerald-50/50 px-1.5 py-0.5 rounded flex items-center gap-1 mt-1">
+                                    ✓ Ready
+                                  </span>
+                                )}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Right Detail Panel */}
+                      <div className="lg:col-span-3 space-y-6">
+                        {activeInv ? (
+                          <div className="space-y-6">
+                            {/* Card Header & Basic fields */}
+                            <div className="bg-zinc-50 p-5 rounded-2xl border border-zinc-200/60 space-y-4">
+                              <div className="flex items-center justify-between">
+                                <h3 className="font-bold text-zinc-800 text-sm">Invoice Configuration</h3>
+                                <span className={`text-[11px] font-bold px-2.5 py-1 rounded-full ${
+                                  activeInv.isValid ? 'bg-emerald-50 text-emerald-700 border border-emerald-100' : 'bg-red-50 text-red-700 border border-red-100'
+                                }`}>
+                                  {activeInv.isValid ? '✓ Valid' : '⚠️ Has Errors'}
+                                </span>
+                              </div>
+
+                              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+                                <div className="space-y-1">
+                                  <label className="font-bold text-zinc-600">Invoice Date</label>
+                                  <input
+                                    type="text"
+                                    value={activeInv.invoiceDate}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.invoiceDate = e.target.value; })}
+                                    placeholder="DD/MM/YYYY"
+                                    className="w-full p-2 bg-white border border-zinc-200 rounded-lg outline-none focus:ring-1 focus:ring-zinc-900"
+                                  />
+                                </div>
+                                <div className="space-y-1">
+                                  <label className="font-bold text-zinc-600">Invoice No</label>
+                                  <input
+                                    type="text"
+                                    value={activeInv.invoiceNo}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.invoiceNo = e.target.value; })}
+                                    className="w-full p-2 bg-white border border-zinc-200 rounded-lg outline-none focus:ring-1 focus:ring-zinc-900 font-mono"
+                                  />
+                                </div>
+                                <div className="space-y-1">
+                                  <label className="font-bold text-zinc-600">Place of Supply (State)</label>
+                                  <select
+                                    value={activeInv.placeOfSupply}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.placeOfSupply = e.target.value; })}
+                                    className="w-full p-2 bg-white border border-zinc-200 rounded-lg outline-none focus:ring-1 focus:ring-zinc-900 font-medium text-xs"
+                                  >
+                                    {['Andaman and Nicobar Islands', 'Andhra Pradesh', 'Arunachal Pradesh', 'Assam', 'Bihar', 'Chandigarh', 'Chhattisgarh', 'Dadra and Nagar Haveli and Daman and Diu', 'Delhi', 'Goa', 'Gujarat', 'Haryana', 'Himachal Pradesh', 'Jammu and Kashmir', 'Jharkhand', 'Karnataka', 'Kerala', 'Ladakh', 'Lakshadweep', 'Madhya Pradesh', 'Maharashtra', 'Manipur', 'Meghalaya', 'Mizoram', 'Nagaland', 'Odisha', 'Puducherry', 'Punjab', 'Rajasthan', 'Sikkim', 'Tamil Nadu', 'Telangana', 'Tripura', 'Uttar Pradesh', 'Uttarakhand', 'West Bengal'].map(st => (
+                                      <option key={st} value={st}>{st}</option>
+                                    ))}
+                                  </select>
+                                </div>
+
+                                <div className="space-y-1 md:col-span-1">
+                                  <label className="font-bold text-zinc-600">Party Ledger</label>
+                                  <select
+                                    value={activeInv.partyLedger}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.partyLedger = e.target.value; })}
+                                    className="w-full p-2 bg-white border border-zinc-200 rounded-lg outline-none focus:ring-1 focus:ring-zinc-900 font-medium"
+                                  >
+                                    <option value="">-- Select Party Ledger --</option>
+                                    {ledgersList.map(l => (
+                                      <option key={l} value={l}>{l}</option>
+                                    ))}
+                                  </select>
+                                </div>
+
+                                <div className="space-y-1 md:col-span-1">
+                                  <label className="font-bold text-zinc-600">{activeInv.voucherType} Account Ledger</label>
+                                  <select
+                                    value={activeInv.salesPurchaseLedger}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.salesPurchaseLedger = e.target.value; })}
+                                    className="w-full p-2 bg-white border border-zinc-200 rounded-lg outline-none focus:ring-1 focus:ring-zinc-900 font-medium"
+                                  >
+                                    <option value="">-- Select Ledger --</option>
+                                    {ledgersList.map(l => (
+                                      <option key={l} value={l}>{l}</option>
+                                    ))}
+                                  </select>
+                                </div>
+
+                                <div className="space-y-1 md:col-span-1">
+                                  <label className="font-bold text-zinc-600">GST Mode</label>
+                                  <select
+                                    value={activeInv.gstMode}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.gstMode = e.target.value as 'Auto' | 'Manual'; })}
+                                    className="w-full p-2 bg-white border border-zinc-200 rounded-lg outline-none focus:ring-1 focus:ring-zinc-900 font-medium"
+                                  >
+                                    <option value="Auto">Auto (Auto-Calculated from Pos)</option>
+                                    <option value="Manual">Manual (Custom Ledger/Amounts)</option>
+                                  </select>
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* Dispatch, Transport & Party details in grid */}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                              <div className="p-4 border border-zinc-100 rounded-xl bg-white space-y-3">
+                                <h4 className="font-bold text-xs text-zinc-800 flex items-center gap-1.5 border-b border-zinc-50 pb-2">
+                                  <Building className="w-4 h-4 text-zinc-400" />
+                                  Dispatch & Transport Details
+                                </h4>
+                                <div className="grid grid-cols-2 gap-3.5 text-xs">
+                                  <div className="space-y-1">
+                                    <span className="font-semibold text-zinc-500">Dispatch Date</span>
+                                    <input
+                                      type="text"
+                                      value={activeInv.dispatchDate}
+                                      onChange={(e) => updateActiveInvoice(inv => { inv.dispatchDate = e.target.value; })}
+                                      className="w-full p-1.5 border border-zinc-200 rounded outline-none text-xs"
+                                      placeholder="DD/MM/YYYY"
+                                    />
+                                  </div>
+                                  <div className="space-y-1">
+                                    <span className="font-semibold text-zinc-500">Vehicle No</span>
+                                    <input
+                                      type="text"
+                                      value={activeInv.vehicleNo}
+                                      onChange={(e) => updateActiveInvoice(inv => { inv.vehicleNo = e.target.value; })}
+                                      className="w-full p-1.5 border border-zinc-200 rounded outline-none text-xs font-mono"
+                                      placeholder="MH-12-XX-1234"
+                                    />
+                                  </div>
+                                  <div className="space-y-1">
+                                    <span className="font-semibold text-zinc-500">Transporter Name</span>
+                                    <input
+                                      type="text"
+                                      value={activeInv.transporterName}
+                                      onChange={(e) => updateActiveInvoice(inv => { inv.transporterName = e.target.value; })}
+                                      className="w-full p-1.5 border border-zinc-200 rounded outline-none text-xs"
+                                    />
+                                  </div>
+                                  <div className="space-y-1">
+                                    <span className="font-semibold text-zinc-500">Transporter GSTIN</span>
+                                    <input
+                                      type="text"
+                                      value={activeInv.transporterGSTIN}
+                                      onChange={(e) => updateActiveInvoice(inv => { inv.transporterGSTIN = e.target.value; })}
+                                      className="w-full p-1.5 border border-zinc-200 rounded outline-none text-xs font-mono"
+                                    />
+                                  </div>
+                                  <div className="space-y-1">
+                                    <span className="font-semibold text-zinc-500">Delivery Note No</span>
+                                    <input
+                                      type="text"
+                                      value={activeInv.deliveryNoteNo}
+                                      onChange={(e) => updateActiveInvoice(inv => { inv.deliveryNoteNo = e.target.value; })}
+                                      className="w-full p-1.5 border border-zinc-200 rounded outline-none text-xs"
+                                    />
+                                  </div>
+                                  <div className="space-y-1">
+                                    <span className="font-semibold text-zinc-500">Bilty LR No</span>
+                                    <input
+                                      type="text"
+                                      value={activeInv.biltyLRNo}
+                                      onChange={(e) => updateActiveInvoice(inv => { inv.biltyLRNo = e.target.value; })}
+                                      className="w-full p-1.5 border border-zinc-200 rounded outline-none text-xs"
+                                    />
+                                  </div>
+                                  <div className="space-y-1">
+                                    <span className="font-semibold text-zinc-500">Mode of Transport</span>
+                                    <input
+                                      type="text"
+                                      value={activeInv.modeOfTransport}
+                                      onChange={(e) => updateActiveInvoice(inv => { inv.modeOfTransport = e.target.value; })}
+                                      className="w-full p-1.5 border border-zinc-200 rounded outline-none text-xs"
+                                      placeholder="Road/Air/Rail"
+                                    />
+                                  </div>
+                                  <div className="space-y-1">
+                                    <span className="font-semibold text-zinc-500">Eway Bill No</span>
+                                    <input
+                                      type="text"
+                                      value={activeInv.ewayBillNo}
+                                      onChange={(e) => updateActiveInvoice(inv => { inv.ewayBillNo = e.target.value; })}
+                                      className="w-full p-1.5 border border-zinc-200 rounded outline-none text-xs font-mono"
+                                    />
+                                  </div>
+                                </div>
+                              </div>
+
+                              <div className="p-4 border border-zinc-100 rounded-xl bg-white space-y-3">
+                                <h4 className="font-bold text-xs text-zinc-800 flex items-center gap-1.5 border-b border-zinc-50 pb-2">
+                                  <Building className="w-4 h-4 text-zinc-400" />
+                                  Party Address & Billing Info
+                                </h4>
+                                <div className="grid grid-cols-2 gap-3.5 text-xs">
+                                  <div className="space-y-1 col-span-2">
+                                    <span className="font-semibold text-zinc-500">Party GSTIN</span>
+                                    <input
+                                      type="text"
+                                      value={activeInv.partyGSTIN}
+                                      onChange={(e) => updateActiveInvoice(inv => { inv.partyGSTIN = e.target.value; })}
+                                      className="w-full p-1.5 border border-zinc-200 rounded outline-none text-xs font-mono"
+                                      placeholder="GSTIN"
+                                    />
+                                  </div>
+                                  <div className="space-y-1 col-span-2">
+                                    <span className="font-semibold text-zinc-500">Address Line 1</span>
+                                    <input
+                                      type="text"
+                                      value={activeInv.partyAddress1}
+                                      onChange={(e) => updateActiveInvoice(inv => { inv.partyAddress1 = e.target.value; })}
+                                      className="w-full p-1.5 border border-zinc-200 rounded outline-none text-xs"
+                                    />
+                                  </div>
+                                  <div className="space-y-1 col-span-2">
+                                    <span className="font-semibold text-zinc-500">Address Line 2</span>
+                                    <input
+                                      type="text"
+                                      value={activeInv.partyAddress2}
+                                      onChange={(e) => updateActiveInvoice(inv => { inv.partyAddress2 = e.target.value; })}
+                                      className="w-full p-1.5 border border-zinc-200 rounded outline-none text-xs"
+                                    />
+                                  </div>
+                                  <div className="space-y-1 col-span-2">
+                                    <span className="font-semibold text-zinc-500">Party State</span>
+                                    <input
+                                      type="text"
+                                      value={activeInv.partyState}
+                                      onChange={(e) => updateActiveInvoice(inv => { inv.partyState = e.target.value; })}
+                                      className="w-full p-1.5 border border-zinc-200 rounded outline-none text-xs"
+                                    />
+                                  </div>
+                                  <div className="space-y-1 col-span-2">
+                                    <span className="font-semibold text-zinc-500">Party Registration Type</span>
+                                    <select
+                                      value={activeInv.partyRegistrationType || 'Regular'}
+                                      onChange={(e) => updateActiveInvoice(inv => { inv.partyRegistrationType = e.target.value; })}
+                                      className="w-full p-1.5 border border-zinc-200 rounded outline-none text-xs bg-white"
+                                    >
+                                      <option value="Regular">Regular</option>
+                                      <option value="Unregistered">Unregistered</option>
+                                      <option value="Composition">Composition</option>
+                                      <option value="Consumer">Consumer</option>
+                                    </select>
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* Inventory Items table */}
+                            <div className="border border-zinc-200 rounded-xl overflow-hidden">
+                              <div className="p-3 bg-zinc-50 border-b border-zinc-200 flex items-center justify-between">
+                                <h4 className="font-bold text-xs text-zinc-700">Inventory Items ({activeInv.items.length})</h4>
+                                <button
+                                  type="button"
+                                  onClick={() => updateActiveInvoice(inv => {
+                                    inv.items.push({
+                                      stockItem: '',
+                                      description: '',
+                                      quantity: 1,
+                                      unit: 'NOS',
+                                      rate: 0,
+                                      itemAmount: 0,
+                                      discountPercent: 0,
+                                      discountAmount: 0,
+                                      taxableValue: 0,
+                                      hsn: '',
+                                      gstRate: 18,
+                                      cgstLedger: '',
+                                      cgstAmount: 0,
+                                      sgstLedger: '',
+                                      sgstAmount: 0,
+                                      igstLedger: '',
+                                      igstAmount: 0,
+                                      gstRateSource: 'User Entered'
+                                    });
+                                  })}
+                                  className="text-[11px] font-bold text-zinc-900 bg-white border border-zinc-200 hover:bg-zinc-50 px-2.5 py-1.5 rounded-lg transition-colors"
+                                >
+                                  + Add Item Line
+                                </button>
+                              </div>
+
+                              <div className="overflow-x-auto">
+                                <table className="w-full text-left text-xs border-collapse">
+                                  <thead>
+                                    <tr className="bg-zinc-50/50 border-b border-zinc-200 text-zinc-600 font-bold">
+                                      <th className="p-2.5">Stock Item Name</th>
+                                      <th className="p-2.5 w-16 text-center">Qty</th>
+                                      <th className="p-2.5 w-16 text-center">Unit</th>
+                                      <th className="p-2.5 w-20 text-right">Rate</th>
+                                      <th className="p-2.5 w-24 text-right">Amount</th>
+                                      <th className="p-2.5 w-16 text-right">Disc %</th>
+                                      <th className="p-2.5 w-24 text-right">Taxable</th>
+                                      <th className="p-2.5 w-16 text-center">GST %</th>
+                                      <th className="p-2.5 w-12 text-center"></th>
+                                    </tr>
+                                  </thead>
+                                  <tbody className="divide-y divide-zinc-100">
+                                    {activeInv.items.map((item, itemIdx) => {
+                                      const isStockInMaster = stockItemsList.some(s => s.toLowerCase() === item.stockItem.toLowerCase());
+                                      return (
+                                        <React.Fragment key={itemIdx}>
+                                          <tr>
+                                            <td className="p-2.5 min-w-[150px]">
+                                              <select
+                                                value={item.stockItem}
+                                                onChange={(e) => updateActiveInvoice(inv => {
+                                                  const it = inv.items[itemIdx];
+                                                  it.stockItem = e.target.value;
+                                                  // Auto autofill master values
+                                                  const sDetails = tallyContext?.stockItemDetails?.find(sm => sm.itemName === e.target.value);
+                                                  if (sDetails) {
+                                                    it.unit = sDetails.unit || 'NOS';
+                                                    it.hsn = sDetails.hsn || '';
+                                                    if (sDetails.gstRate) {
+                                                      it.gstRate = parseFloat(sDetails.gstRate);
+                                                      it.gstRateSource = 'Stock Master';
+                                                    }
+                                                  }
+                                                })}
+                                                className="w-full p-1.5 bg-white border border-zinc-200 rounded font-medium text-xs focus:ring-1 focus:ring-zinc-900"
+                                              >
+                                                <option value="">-- Select Item --</option>
+                                                {stockItemsList.map(st => (
+                                                  <option key={st} value={st}>{st}</option>
+                                                ))}
+                                                {item.stockItem && !isStockInMaster && (
+                                                  <option value={item.stockItem}>{item.stockItem} (not in masters)</option>
+                                                )}
+                                              </select>
+                                              <input
+                                                type="text"
+                                                value={item.description}
+                                                onChange={(e) => updateActiveInvoice(inv => { inv.items[itemIdx].description = e.target.value; })}
+                                                placeholder="Description / Batch info..."
+                                                className="w-full p-1 mt-1 text-[11px] border border-zinc-100 rounded text-zinc-500 placeholder-zinc-300"
+                                              />
+                                              {!isStockInMaster && item.stockItem && (
+                                                <span className="text-[10px] text-amber-600 block mt-0.5">⚠️ Stock item not found in Masters</span>
+                                              )}
+                                            </td>
+                                            <td className="p-2.5">
+                                              <input
+                                                type="number"
+                                                value={item.quantity}
+                                                onChange={(e) => updateActiveInvoice(inv => {
+                                                  const it = inv.items[itemIdx];
+                                                  it.quantity = parseFloat(e.target.value) || 0;
+                                                  it.itemAmount = it.quantity * it.rate;
+                                                  it.discountAmount = it.itemAmount * (it.discountPercent / 100);
+                                                  it.taxableValue = it.itemAmount - it.discountAmount;
+                                                })}
+                                                className="w-full p-1.5 border border-zinc-200 rounded text-center text-xs"
+                                              />
+                                            </td>
+                                            <td className="p-2.5">
+                                              <select
+                                                value={item.unit}
+                                                onChange={(e) => updateActiveInvoice(inv => { inv.items[itemIdx].unit = e.target.value; })}
+                                                className="w-full p-1.5 border border-zinc-200 rounded text-center text-xs font-medium"
+                                              >
+                                                {unitsList.map(u => (
+                                                  <option key={u} value={u}>{u}</option>
+                                                ))}
+                                              </select>
+                                            </td>
+                                            <td className="p-2.5">
+                                              <input
+                                                type="number"
+                                                value={item.rate}
+                                                onChange={(e) => updateActiveInvoice(inv => {
+                                                  const it = inv.items[itemIdx];
+                                                  it.rate = parseFloat(e.target.value) || 0;
+                                                  it.itemAmount = it.quantity * it.rate;
+                                                  it.discountAmount = it.itemAmount * (it.discountPercent / 100);
+                                                  it.taxableValue = it.itemAmount - it.discountAmount;
+                                                })}
+                                                className="w-full p-1.5 border border-zinc-200 rounded text-right text-xs"
+                                              />
+                                            </td>
+                                            <td className="p-2.5 text-right font-semibold text-zinc-800">
+                                              ₹{item.itemAmount.toFixed(2)}
+                                            </td>
+                                            <td className="p-2.5">
+                                              <input
+                                                type="number"
+                                                value={item.discountPercent}
+                                                onChange={(e) => updateActiveInvoice(inv => {
+                                                  const it = inv.items[itemIdx];
+                                                  it.discountPercent = parseFloat(e.target.value) || 0;
+                                                  it.discountAmount = it.itemAmount * (it.discountPercent / 100);
+                                                  it.taxableValue = it.itemAmount - it.discountAmount;
+                                                })}
+                                                className="w-full p-1.5 border border-zinc-200 rounded text-right text-xs"
+                                              />
+                                            </td>
+                                            <td className="p-2.5">
+                                              <input
+                                                type="number"
+                                                value={item.taxableValue}
+                                                onChange={(e) => updateActiveInvoice(inv => {
+                                                  const it = inv.items[itemIdx];
+                                                  it.taxableValue = parseFloat(e.target.value) || 0;
+                                                })}
+                                                className="w-full p-1.5 border border-zinc-200 rounded text-right text-xs font-semibold"
+                                              />
+                                            </td>
+                                            <td className="p-2.5">
+                                              <div className="space-y-1">
+                                                <input
+                                                  type="number"
+                                                  value={item.gstRate}
+                                                  onChange={(e) => updateActiveInvoice(inv => {
+                                                    inv.items[itemIdx].gstRate = parseFloat(e.target.value) || 0;
+                                                    inv.items[itemIdx].gstRateSource = 'User Entered';
+                                                  })}
+                                                  className="w-full p-1.5 border border-zinc-200 rounded text-center text-xs"
+                                                />
+                                                <span className={`text-[9px] block text-center font-bold uppercase rounded-full px-1 py-0.2 ${
+                                                  item.gstRateSource === 'Stock Master' ? 'bg-emerald-50 text-emerald-600' : 'bg-zinc-100 text-zinc-600'
+                                                }`}>
+                                                  {item.gstRateSource === 'Stock Master' ? 'Master' : 'User'}
+                                                </span>
+                                              </div>
+                                            </td>
+                                            <td className="p-2.5 text-center">
+                                              <button
+                                                type="button"
+                                                onClick={() => updateActiveInvoice(inv => {
+                                                  inv.items.splice(itemIdx, 1);
+                                                })}
+                                                className="text-red-500 hover:text-red-700 transition-colors font-bold text-xs"
+                                              >
+                                                ✕
+                                              </button>
+                                            </td>
+                                          </tr>
+
+                                          {/* Custom manual taxes adjustment block or preview block */}
+                                          <tr className="bg-zinc-50/20 border-b border-zinc-200/50">
+                                            <td colSpan={9} className="p-2 text-[11px] text-zinc-500">
+                                              <div className="flex flex-wrap gap-4 items-center pl-4 pb-2">
+                                                <span className="font-bold text-[10px] text-zinc-400 uppercase tracking-wider">GST Distribution:</span>
+                                                {activeInv.gstMode === 'Auto' ? (
+                                                  <div className="flex gap-4 items-center text-zinc-700">
+                                                    {item.cgstAmount > 0 && (
+                                                      <span>
+                                                        CGST ({item.gstRate/2}%): <strong className="font-semibold text-zinc-900">{item.cgstLedger || 'Auto-matched'}</strong> = ₹{item.cgstAmount.toFixed(2)}
+                                                      </span>
+                                                    )}
+                                                    {item.sgstAmount > 0 && (
+                                                      <span>
+                                                        SGST ({item.gstRate/2}%): <strong className="font-semibold text-zinc-900">{item.sgstLedger || 'Auto-matched'}</strong> = ₹{item.sgstAmount.toFixed(2)}
+                                                      </span>
+                                                    )}
+                                                    {item.igstAmount > 0 && (
+                                                      <span>
+                                                        IGST ({item.gstRate}%): <strong className="font-semibold text-zinc-900">{item.igstLedger || 'Auto-matched'}</strong> = ₹{item.igstAmount.toFixed(2)}
+                                                      </span>
+                                                    )}
+                                                  </div>
+                                                ) : (
+                                                  <div className="flex flex-wrap gap-3.5 items-center">
+                                                    {/* Manual Tax fields inputs */}
+                                                    <div className="flex items-center gap-1 text-[11px]">
+                                                      <span>CGST Ledger:</span>
+                                                      <select
+                                                        value={item.cgstLedger}
+                                                        onChange={(e) => updateActiveInvoice(inv => { inv.items[itemIdx].cgstLedger = e.target.value; })}
+                                                        className="p-1 border border-zinc-200 bg-white rounded text-[11px] max-w-[130px]"
+                                                      >
+                                                        <option value="">-- None --</option>
+                                                        {ledgersList.map(l => <option key={l} value={l}>{l}</option>)}
+                                                      </select>
+                                                      <input
+                                                        type="number"
+                                                        value={item.cgstAmount}
+                                                        onChange={(e) => updateActiveInvoice(inv => { inv.items[itemIdx].cgstAmount = parseFloat(e.target.value) || 0; })}
+                                                        className="p-1 border border-zinc-200 rounded text-right text-[11px] w-16"
+                                                      />
+                                                    </div>
+
+                                                    <div className="flex items-center gap-1 text-[11px]">
+                                                      <span>SGST Ledger:</span>
+                                                      <select
+                                                        value={item.sgstLedger}
+                                                        onChange={(e) => updateActiveInvoice(inv => { inv.items[itemIdx].sgstLedger = e.target.value; })}
+                                                        className="p-1 border border-zinc-200 bg-white rounded text-[11px] max-w-[130px]"
+                                                      >
+                                                        <option value="">-- None --</option>
+                                                        {ledgersList.map(l => <option key={l} value={l}>{l}</option>)}
+                                                      </select>
+                                                      <input
+                                                        type="number"
+                                                        value={item.sgstAmount}
+                                                        onChange={(e) => updateActiveInvoice(inv => { inv.items[itemIdx].sgstAmount = parseFloat(e.target.value) || 0; })}
+                                                        className="p-1 border border-zinc-200 rounded text-right text-[11px] w-16"
+                                                      />
+                                                    </div>
+
+                                                    <div className="flex items-center gap-1 text-[11px]">
+                                                      <span>IGST Ledger:</span>
+                                                      <select
+                                                        value={item.igstLedger}
+                                                        onChange={(e) => updateActiveInvoice(inv => { inv.items[itemIdx].igstLedger = e.target.value; })}
+                                                        className="p-1 border border-zinc-200 bg-white rounded text-[11px] max-w-[130px]"
+                                                      >
+                                                        <option value="">-- None --</option>
+                                                        {ledgersList.map(l => <option key={l} value={l}>{l}</option>)}
+                                                      </select>
+                                                      <input
+                                                        type="number"
+                                                        value={item.igstAmount}
+                                                        onChange={(e) => updateActiveInvoice(inv => { inv.items[itemIdx].igstAmount = parseFloat(e.target.value) || 0; })}
+                                                        className="p-1 border border-zinc-200 rounded text-right text-[11px] w-16"
+                                                      />
+                                                    </div>
+                                                  </div>
+                                                )}
+                                              </div>
+                                            </td>
+                                          </tr>
+                                        </React.Fragment>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </div>
+
+                            {/* Additional Charges / Expenses / Round-off */}
+                            <div className="bg-zinc-50/50 p-5 rounded-2xl border border-zinc-200/60 space-y-4 text-xs">
+                              <h4 className="font-bold text-xs text-zinc-800 border-b border-zinc-100 pb-2">Additional Accounting Ledger Lines</h4>
+                              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                                <div className="space-y-1">
+                                  <span className="font-bold text-zinc-500">Freight Ledger</span>
+                                  <select
+                                    value={activeInv.freightLedger}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.freightLedger = e.target.value; })}
+                                    className="w-full p-1.5 bg-white border border-zinc-200 rounded text-xs"
+                                  >
+                                    <option value="">-- Select Freight Ldg --</option>
+                                    {ledgersList.map(l => <option key={l} value={l}>{l}</option>)}
+                                  </select>
+                                  <input
+                                    type="number"
+                                    value={activeInv.freightAmount}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.freightAmount = parseFloat(e.target.value) || 0; })}
+                                    className="w-full p-1.5 border border-zinc-200 rounded text-right mt-1 font-mono text-xs"
+                                    placeholder="Amount"
+                                  />
+                                </div>
+
+                                <div className="space-y-1">
+                                  <span className="font-bold text-zinc-500">Packing Ledger</span>
+                                  <select
+                                    value={activeInv.packingLedger}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.packingLedger = e.target.value; })}
+                                    className="w-full p-1.5 bg-white border border-zinc-200 rounded text-xs"
+                                  >
+                                    <option value="">-- Select Packing Ldg --</option>
+                                    {ledgersList.map(l => <option key={l} value={l}>{l}</option>)}
+                                  </select>
+                                  <input
+                                    type="number"
+                                    value={activeInv.packingAmount}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.packingAmount = parseFloat(e.target.value) || 0; })}
+                                    className="w-full p-1.5 border border-zinc-200 rounded text-right mt-1 font-mono text-xs"
+                                    placeholder="Amount"
+                                  />
+                                </div>
+
+                                <div className="space-y-1">
+                                  <span className="font-bold text-zinc-500">Loading Ledger</span>
+                                  <select
+                                    value={activeInv.loadingLedger}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.loadingLedger = e.target.value; })}
+                                    className="w-full p-1.5 bg-white border border-zinc-200 rounded text-xs"
+                                  >
+                                    <option value="">-- Select Loading Ldg --</option>
+                                    {ledgersList.map(l => <option key={l} value={l}>{l}</option>)}
+                                  </select>
+                                  <input
+                                    type="number"
+                                    value={activeInv.loadingAmount}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.loadingAmount = parseFloat(e.target.value) || 0; })}
+                                    className="w-full p-1.5 border border-zinc-200 rounded text-right mt-1 font-mono text-xs"
+                                    placeholder="Amount"
+                                  />
+                                </div>
+
+                                <div className="space-y-1">
+                                  <span className="font-bold text-zinc-500">Insurance Ledger</span>
+                                  <select
+                                    value={activeInv.insuranceLedger}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.insuranceLedger = e.target.value; })}
+                                    className="w-full p-1.5 bg-white border border-zinc-200 rounded text-xs"
+                                  >
+                                    <option value="">-- Select Insurance Ldg --</option>
+                                    {ledgersList.map(l => <option key={l} value={l}>{l}</option>)}
+                                  </select>
+                                  <input
+                                    type="number"
+                                    value={activeInv.insuranceAmount}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.insuranceAmount = parseFloat(e.target.value) || 0; })}
+                                    className="w-full p-1.5 border border-zinc-200 rounded text-right mt-1 font-mono text-xs"
+                                    placeholder="Amount"
+                                  />
+                                </div>
+
+                                <div className="space-y-1">
+                                  <span className="font-bold text-zinc-500">Bill Discount Ledger</span>
+                                  <select
+                                    value={activeInv.discountLedger}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.discountLedger = e.target.value; })}
+                                    className="w-full p-1.5 bg-white border border-zinc-200 rounded text-xs"
+                                  >
+                                    <option value="">-- Select Discount Ldg --</option>
+                                    {ledgersList.map(l => <option key={l} value={l}>{l}</option>)}
+                                  </select>
+                                  <input
+                                    type="number"
+                                    value={activeInv.billDiscountAmount}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.billDiscountAmount = parseFloat(e.target.value) || 0; })}
+                                    className="w-full p-1.5 border border-zinc-200 rounded text-right mt-1 font-mono text-xs text-amber-700"
+                                    placeholder="Discount Value"
+                                  />
+                                </div>
+
+                                <div className="space-y-1">
+                                  <span className="font-bold text-zinc-500">Round Off Ledger</span>
+                                  <select
+                                    value={activeInv.roundOffLedger}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.roundOffLedger = e.target.value; })}
+                                    className="w-full p-1.5 bg-white border border-zinc-200 rounded text-xs"
+                                  >
+                                    <option value="">-- Select Roundoff Ldg --</option>
+                                    {ledgersList.map(l => <option key={l} value={l}>{l}</option>)}
+                                  </select>
+                                  <input
+                                    type="number"
+                                    value={activeInv.roundOffAmount}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.roundOffAmount = parseFloat(e.target.value) || 0; })}
+                                    className="w-full p-1.5 border border-zinc-200 rounded text-right mt-1 font-mono text-xs"
+                                    placeholder="Amount (Auto)"
+                                  />
+                                </div>
+
+                                <div className="space-y-1">
+                                  <span className="font-bold text-zinc-500">Other Charges 1</span>
+                                  <select
+                                    value={activeInv.otherLedger1}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.otherLedger1 = e.target.value; })}
+                                    className="w-full p-1.5 bg-white border border-zinc-200 rounded text-xs"
+                                  >
+                                    <option value="">-- Select Ledger --</option>
+                                    {ledgersList.map(l => <option key={l} value={l}>{l}</option>)}
+                                  </select>
+                                  <input
+                                    type="number"
+                                    value={activeInv.otherAmount1}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.otherAmount1 = parseFloat(e.target.value) || 0; })}
+                                    className="w-full p-1.5 border border-zinc-200 rounded text-right mt-1 font-mono text-xs"
+                                  />
+                                </div>
+
+                                <div className="space-y-1">
+                                  <span className="font-bold text-zinc-500">Other Charges 2</span>
+                                  <select
+                                    value={activeInv.otherLedger2}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.otherLedger2 = e.target.value; })}
+                                    className="w-full p-1.5 bg-white border border-zinc-200 rounded text-xs"
+                                  >
+                                    <option value="">-- Select Ledger --</option>
+                                    {ledgersList.map(l => <option key={l} value={l}>{l}</option>)}
+                                  </select>
+                                  <input
+                                    type="number"
+                                    value={activeInv.otherAmount2}
+                                    onChange={(e) => updateActiveInvoice(inv => { inv.otherAmount2 = parseFloat(e.target.value) || 0; })}
+                                    className="w-full p-1.5 border border-zinc-200 rounded text-right mt-1 font-mono text-xs"
+                                  />
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* Summary Calculations Footer Panel */}
+                            <div className="bg-zinc-900 text-white p-6 rounded-2xl border border-zinc-800 flex flex-col md:flex-row md:items-center justify-between gap-6">
+                              <div className="grid grid-cols-2 md:grid-cols-4 gap-6 text-xs flex-1">
+                                <div>
+                                  <span className="text-zinc-400 block mb-1">Total Taxable Value</span>
+                                  <span className="font-mono text-base font-bold text-white">₹{activeInv.totalTaxableValue.toFixed(2)}</span>
+                                </div>
+                                <div>
+                                  <span className="text-zinc-400 block mb-1">Total CGST + SGST</span>
+                                  <span className="font-mono text-base font-bold text-white">₹{(activeInv.totalCGST + activeInv.totalSGST).toFixed(2)}</span>
+                                </div>
+                                <div>
+                                  <span className="text-zinc-400 block mb-1">Total IGST</span>
+                                  <span className="font-mono text-base font-bold text-white">₹{activeInv.totalIGST.toFixed(2)}</span>
+                                </div>
+                                <div>
+                                  <span className="text-zinc-400 block mb-1">Additional Charges</span>
+                                  <span className="font-mono text-base font-bold text-white">₹{activeInv.totalAdditionalCharges.toFixed(2)}</span>
+                                </div>
+                              </div>
+                              <div className="border-t md:border-t-0 md:border-l border-zinc-800 pt-4 md:pt-0 md:pl-6 shrink-0 text-right">
+                                <span className="text-zinc-400 block text-xs mb-1">Grand Invoice Total</span>
+                                <span className="font-mono text-2xl font-black text-emerald-400">
+                                  ₹{activeInv.invoiceTotal.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* Alert Notifications list if any */}
+                            {(activeInv.errors.length > 0 || activeInv.warnings.length > 0) && (
+                              <div className="p-4 rounded-xl border space-y-2 bg-amber-50/25 border-amber-200/50 text-xs">
+                                <h5 className="font-bold text-amber-800">Action Items & Validation Messages</h5>
+                                <ul className="space-y-1.5 text-zinc-600 list-disc pl-5">
+                                  {activeInv.errors.map((err, i) => (
+                                    <li key={i} className="text-red-700 font-medium">{err}</li>
+                                  ))}
+                                  {activeInv.warnings.map((warn, i) => (
+                                    <li key={i} className="text-amber-700">{warn}</li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="text-center py-20 text-zinc-400 border border-dashed border-zinc-200 rounded-2xl">
+                            Select an invoice from the sidebar to view or customize.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Footer wizard controls */}
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pt-4 border-t border-zinc-100">
+                      <div className="text-xs text-zinc-500">
+                        Invoices are automatically compiled and validated according to strict Tally guidelines.
+                      </div>
+                      <div className="flex items-center gap-3 justify-end shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => setCurrentStep('upload')}
+                          className="px-5 py-3 hover:bg-zinc-100 border border-zinc-200 text-zinc-700 rounded-xl text-xs font-bold transition-all flex items-center gap-2"
+                        >
+                          <RotateCcw className="w-4 h-4" />
+                          Cancel & Back
+                        </button>
+                        <button
+                          type="button"
+                          onClick={generateSalesPurchaseXMLFromVerification}
+                          disabled={isProcessing || salesPurchaseInvoices.some(i => !i.isValid)}
+                          className="px-6 py-3 bg-zinc-900 hover:bg-zinc-850 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-2 disabled:opacity-50 shadow-sm"
+                        >
+                          {isProcessing ? (
+                            <>
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                              Generating XML...
+                            </>
+                          ) : (
+                            <>
+                              <CheckCircle2 className="w-4 h-4" />
+                              Confirm & Generate Tally XML
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  </motion.section>
+                );
+              })()}
+
               {currentStep === 'complete' && (
                 <motion.section 
                   key="complete"
@@ -5131,9 +7366,11 @@ export default function App() {
                     </div>
                     <h2 className="text-3xl font-bold mb-2">Conversion Successful!</h2>
                     <p className="text-zinc-400 mb-8 max-w-md mx-auto">
-                      {importType === 'Voucher' 
-                        ? 'Your bank statement has been successfully mapped and converted to Tally XML format.'
-                        : `Your Tally ${importType} Masters have been successfully validated and converted to Tally XML format.`
+                      {conversions[0]?.voucherType === 'SalesPurchase'
+                        ? 'Your Sales & Purchase item invoices have been successfully grouped, calculated, and converted to Tally-compliant XML format.'
+                        : importType === 'Voucher' 
+                          ? 'Your bank statement has been successfully mapped and converted to Tally XML format.'
+                          : `Your Tally ${importType} Masters have been successfully validated and converted to Tally XML format.`
                       }
                     </p>
                     
@@ -5149,7 +7386,7 @@ export default function App() {
                         Download XML
                       </button>
                       
-                      {importType === 'Voucher' ? (
+                      {conversions[0]?.voucherType === 'SalesPurchase' ? null : importType === 'Voucher' ? (
                         <button 
                           onClick={() => {
                             const lastConv = conversions[0];
