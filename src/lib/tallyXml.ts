@@ -487,6 +487,8 @@ export function generateUnitsXML(units: TallyUnitMaster[]): string {
 }
 
 export interface SalesPurchaseInvoice {
+  voucherMode?: 'Auto' | 'Item Invoice' | 'Accounting';
+  inventoryMode?: 'Inventory Optional';
   errors: string[];
   warnings: string[];
   isValid: boolean;
@@ -639,6 +641,20 @@ export function generateSalesPurchaseXML(invoices: SalesPurchaseInvoice[], compa
                 }
               ];
 
+              // If Accounting mode, add Sales/Purchase ledger as a direct ledger entry
+              if (inv.voucherMode === 'Accounting') {
+                const totalTaxable = inv.items.reduce((sum, item) => sum + item.taxableValue, 0);
+                const spAmountSign = isSales ? totalTaxable : -totalTaxable;
+                const spDeemedPositive = isSales ? 'No' : 'Yes';
+                ledgerEntriesList.push({
+                  LEDGERNAME: inv.salesPurchaseLedger,
+                  ISDEEMEDPOSITIVE: spDeemedPositive,
+                  ISLASTDEEMEDPOSITIVE: spDeemedPositive,
+                  ISPARTYLEDGER: 'No',
+                  AMOUNT: spAmountSign.toFixed(2),
+                });
+              }
+
               // 2. GST ledger entries
               const gstLedgerSums: Record<string, number> = {};
               inv.items.forEach(item => {
@@ -699,8 +715,8 @@ export function generateSalesPurchaseXML(invoices: SalesPurchaseInvoice[], compa
                 }
               });
 
-              // 4. Stock items list
-              const inventoryEntriesList = inv.items.map(item => {
+              // 4. Stock items list (only if NOT in Accounting mode)
+              const inventoryEntriesList = inv.voucherMode === 'Accounting' ? [] : inv.items.map(item => {
                 const itemAmountVal = item.taxableValue;
                 const inventoryAmountSign = isSales ? itemAmountVal : -itemAmountVal;
                 const invDeemedPositive = isSales ? 'No' : 'Yes';
@@ -809,7 +825,7 @@ export function generateSalesPurchaseXML(invoices: SalesPurchaseInvoice[], compa
                   BASICBASEPARTYNAME: inv.partyLedger,
                   PERSISTEDVIEW: 'Invoice Voucher View',
                   VCHSTATUSVOUCHERTYPE: inv.voucherType,
-                  VCHENTRYMODE: 'Item Invoice',
+                  VCHENTRYMODE: inv.voucherMode === 'Accounting' ? 'Accounting Invoice' : 'Item Invoice',
                   ISINVOICE: 'Yes',
                   HASCASHFLOW: 'No',
                   
@@ -833,7 +849,7 @@ export function generateSalesPurchaseXML(invoices: SalesPurchaseInvoice[], compa
                   BASICMODEOFTRANSPORT: inv.modeOfTransport || undefined,
                   NARRATION: finalNarration || undefined,
 
-                  'ALLINVENTORYENTRIES.LIST': inventoryEntriesList,
+                  ...(inv.voucherMode === 'Accounting' ? {} : { 'ALLINVENTORYENTRIES.LIST': inventoryEntriesList }),
                   'LEDGERENTRIES.LIST': ledgerEntriesList,
                 }
               };

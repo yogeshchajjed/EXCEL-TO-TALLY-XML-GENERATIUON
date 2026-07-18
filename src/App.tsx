@@ -74,6 +74,19 @@ import {
   SalesPurchaseInvoice,
   generateSalesPurchaseXML
 } from './lib/tallyXml';
+import { parseSalesPurchaseExcel } from './lib/salesPurchaseParser';
+import {
+  MissingLedgerItem,
+  MissingStockItem,
+  detectMissingLedgers,
+  detectMissingStockItems,
+  generateGroupMasterXML,
+  generateUnitMasterXML,
+  generateStockGroupMasterXML,
+  generateMissingLedgerMastersXML,
+  generateMissingStockItemMastersXML,
+  generateCombinedImportXML
+} from './lib/missingMasters';
 
 // Set up PDF.js worker
 if (getAppMode() !== 'desktop-offline') {
@@ -309,246 +322,7 @@ export default function App() {
   };
 
   const processSalesPurchaseExcel = (jsonData: any[]): SalesPurchaseInvoice[] => {
-    const getVal = (row: any, key: string): any => {
-      if (row[key] !== undefined) return row[key];
-      const foundKey = Object.keys(row).find(k => k.toLowerCase().trim() === key.toLowerCase().trim());
-      return foundKey ? row[foundKey] : undefined;
-    };
-
-    const groups: Record<string, any[]> = {};
-    jsonData.forEach((row, idx) => {
-      const vType = String(getVal(row, 'Voucher Type') || getVal(row, 'VoucherType') || 'Sales').trim();
-      let invDate = getVal(row, 'Invoice Date') || getVal(row, 'InvoiceDate') || getVal(row, 'Date') || '';
-      
-      if (invDate instanceof Date) {
-        invDate = invDate.toLocaleDateString('en-GB');
-      } else if (typeof invDate === 'number' && invDate > 40000) {
-        const date = new Date((invDate - 25569) * 86400 * 1000);
-        invDate = date.toLocaleDateString('en-GB');
-      } else {
-        invDate = String(invDate).trim();
-      }
-
-      const invNo = String(getVal(row, 'Invoice No') || getVal(row, 'InvoiceNo') || getVal(row, 'Voucher No') || getVal(row, 'VoucherNo') || `TEMP-${idx}`).trim();
-      const party = String(getVal(row, 'Party Ledger') || getVal(row, 'PartyLedger') || getVal(row, 'Particulars') || '').trim();
-
-      const key = `${vType}_${invDate}_${invNo}_${party}`;
-      if (!groups[key]) {
-        groups[key] = [];
-      }
-      groups[key].push(row);
-    });
-
-    const parsedInvoices: SalesPurchaseInvoice[] = [];
-
-    Object.entries(groups).forEach(([key, rows]) => {
-      const firstRow = rows[0];
-      const vType = String(getVal(firstRow, 'Voucher Type') || getVal(firstRow, 'VoucherType') || 'Sales').trim() as 'Sales' | 'Purchase';
-      
-      let invDate = getVal(firstRow, 'Invoice Date') || getVal(firstRow, 'InvoiceDate') || getVal(firstRow, 'Date') || '';
-      if (invDate instanceof Date) {
-        invDate = invDate.toLocaleDateString('en-GB');
-      } else if (typeof invDate === 'number' && invDate > 40000) {
-        const date = new Date((invDate - 25569) * 86400 * 1000);
-        invDate = date.toLocaleDateString('en-GB');
-      } else {
-        invDate = String(invDate).trim();
-      }
-
-      const invNo = String(getVal(firstRow, 'Invoice No') || getVal(firstRow, 'InvoiceNo') || getVal(firstRow, 'Voucher No') || getVal(firstRow, 'VoucherNo') || '').trim();
-      const partyLedger = String(getVal(firstRow, 'Party Ledger') || getVal(firstRow, 'PartyLedger') || getVal(firstRow, 'Particulars') || '').trim();
-      const salesPurchaseLedger = String(getVal(firstRow, 'Sales/Purchase Ledger') || getVal(firstRow, 'Sales/PurchaseLedger') || (vType === 'Sales' ? 'Sales Account' : 'Purchase Account')).trim();
-      const narration = String(getVal(firstRow, 'Narration') || '').trim();
-      const reference = String(getVal(firstRow, 'Reference') || '').trim();
-
-      let dispatchDate = getVal(firstRow, 'Dispatch Date') || getVal(firstRow, 'DispatchDate') || '';
-      if (dispatchDate instanceof Date) {
-        dispatchDate = dispatchDate.toLocaleDateString('en-GB');
-      } else if (typeof dispatchDate === 'number' && dispatchDate > 40000) {
-        const date = new Date((dispatchDate - 25569) * 86400 * 1000);
-        dispatchDate = date.toLocaleDateString('en-GB');
-      } else {
-        dispatchDate = String(dispatchDate).trim();
-      }
-
-      const deliveryNoteNo = String(getVal(firstRow, 'Delivery Note No') || getVal(firstRow, 'DeliveryNoteNo') || '').trim();
-      const dispatchDocNo = String(getVal(firstRow, 'Dispatch Doc No') || getVal(firstRow, 'DispatchDocNo') || '').trim();
-      const biltyLRNo = String(getVal(firstRow, 'Bilty LR No') || getVal(firstRow, 'BiltyLRNo') || '').trim();
-      const transporterName = String(getVal(firstRow, 'Transporter Name') || getVal(firstRow, 'TransporterName') || '').trim();
-      const transporterGSTIN = String(getVal(firstRow, 'Transporter GSTIN') || getVal(firstRow, 'TransporterGSTIN') || '').trim();
-      const vehicleNo = String(getVal(firstRow, 'Vehicle No') || getVal(firstRow, 'VehicleNo') || '').trim();
-      const destination = String(getVal(firstRow, 'Destination') || '').trim();
-      const modeOfTransport = String(getVal(firstRow, 'Mode of Transport') || getVal(firstRow, 'ModeOfTransport') || '').trim();
-      const ewayBillNo = String(getVal(firstRow, 'Eway Bill No') || getVal(firstRow, 'EwayBillNo') || '').trim();
-
-      let partyGSTIN = String(getVal(firstRow, 'Party GSTIN') || getVal(firstRow, 'PartyGSTIN') || '').trim();
-      let partyAddress1 = String(getVal(firstRow, 'Party Address 1') || getVal(firstRow, 'PartyAddress1') || '').trim();
-      let partyAddress2 = String(getVal(firstRow, 'Party Address 2') || getVal(firstRow, 'PartyAddress2') || '').trim();
-      let partyState = String(getVal(firstRow, 'Party State') || getVal(firstRow, 'PartyState') || '').trim();
-      let placeOfSupply = String(getVal(firstRow, 'Place of Supply') || getVal(firstRow, 'PlaceOfSupply') || '').trim();
-
-      let partyRegistrationType = String(getVal(firstRow, 'Party Registration Type') || getVal(firstRow, 'PartyRegistrationType') || '').trim();
-      const pMaster = tallyContext?.ledgerDetails?.find(ld => ld.ledgerName.toLowerCase() === partyLedger.toLowerCase());
-      if (pMaster) {
-        if (!partyGSTIN) partyGSTIN = pMaster.gstin || '';
-        if (!partyAddress1) partyAddress1 = pMaster.address1 || '';
-        if (!partyAddress2) partyAddress2 = pMaster.address2 || '';
-        if (!partyState) partyState = pMaster.state || '';
-        if (!partyRegistrationType) partyRegistrationType = pMaster.registrationType || '';
-      }
-      if (!placeOfSupply) placeOfSupply = partyState;
-      if (!partyRegistrationType) {
-        partyRegistrationType = partyGSTIN ? 'Regular' : 'Unregistered';
-      }
-
-      const freightLedger = String(getVal(firstRow, 'Freight Ledger') || getVal(firstRow, 'FreightLedger') || '').trim();
-      const freightAmount = parseFloat(String(getVal(firstRow, 'Freight Amount') || getVal(firstRow, 'FreightAmount') || '0').replace(/,/g, '')) || 0;
-
-      const packingLedger = String(getVal(firstRow, 'Packing Ledger') || getVal(firstRow, 'PackingLedger') || '').trim();
-      const packingAmount = parseFloat(String(getVal(firstRow, 'Packing Amount') || getVal(firstRow, 'PackingAmount') || '0').replace(/,/g, '')) || 0;
-
-      const loadingLedger = String(getVal(firstRow, 'Loading Ledger') || getVal(firstRow, 'LoadingLedger') || '').trim();
-      const loadingAmount = parseFloat(String(getVal(firstRow, 'Loading Amount') || getVal(firstRow, 'LoadingAmount') || '0').replace(/,/g, '')) || 0;
-
-      const insuranceLedger = String(getVal(firstRow, 'Insurance Ledger') || getVal(firstRow, 'InsuranceLedger') || '').trim();
-      const insuranceAmount = parseFloat(String(getVal(firstRow, 'Insurance Amount') || getVal(firstRow, 'InsuranceAmount') || '0').replace(/,/g, '')) || 0;
-
-      const otherLedger1 = String(getVal(firstRow, 'Other Ledger 1') || getVal(firstRow, 'OtherLedger1') || '').trim();
-      const otherAmount1 = parseFloat(String(getVal(firstRow, 'Other Amount 1') || getVal(firstRow, 'OtherAmount1') || '0').replace(/,/g, '')) || 0;
-
-      const otherLedger2 = String(getVal(firstRow, 'Other Ledger 2') || getVal(firstRow, 'OtherLedger2') || '').trim();
-      const otherAmount2 = parseFloat(String(getVal(firstRow, 'Other Amount 2') || getVal(firstRow, 'OtherAmount2') || '0').replace(/,/g, '')) || 0;
-
-      const discountLedger = String(getVal(firstRow, 'Discount Ledger') || getVal(firstRow, 'DiscountLedger') || '').trim();
-      const billDiscountAmount = parseFloat(String(getVal(firstRow, 'Bill Discount Amount') || getVal(firstRow, 'BillDiscountAmount') || '0').replace(/,/g, '')) || 0;
-
-      const roundOffLedger = String(getVal(firstRow, 'Round Off Ledger') || getVal(firstRow, 'RoundOffLedger') || '').trim();
-      const roundOffAmount = parseFloat(String(getVal(firstRow, 'Round Off Amount') || getVal(firstRow, 'RoundOffAmount') || '0').replace(/,/g, '')) || 0;
-
-      const items: SalesPurchaseInvoice['items'] = [];
-
-      rows.forEach(r => {
-        const stockItem = String(getVal(r, 'Stock Item') || getVal(r, 'StockItem') || '').trim();
-        if (!stockItem) return;
-
-        const description = String(getVal(r, 'Description') || '').trim();
-        const quantity = parseFloat(String(getVal(r, 'Quantity') || '0').replace(/,/g, '')) || 0;
-        let unit = String(getVal(r, 'Unit') || '').trim();
-        const rate = parseFloat(String(getVal(r, 'Rate') || '0').replace(/,/g, '')) || 0;
-        let itemAmount = parseFloat(String(getVal(r, 'Item Amount') || getVal(r, 'ItemAmount') || '0').replace(/,/g, '')) || 0;
-        if (itemAmount === 0) itemAmount = quantity * rate;
-
-        const discountPercent = parseFloat(String(getVal(r, 'Discount %') || getVal(r, 'DiscountPercent') || '0').replace(/,/g, '')) || 0;
-        let discountAmount = parseFloat(String(getVal(r, 'Discount Amount') || getVal(r, 'DiscountAmount') || '0').replace(/,/g, '')) || 0;
-        if (discountAmount === 0 && discountPercent > 0) discountAmount = itemAmount * discountPercent / 100;
-
-        let taxableValue = parseFloat(String(getVal(r, 'Taxable Value') || getVal(r, 'TaxableValue') || '0').replace(/,/g, '')) || 0;
-        if (taxableValue === 0) taxableValue = itemAmount - discountAmount;
-
-        let hsn = String(getVal(r, 'HSN/SAC') || getVal(r, 'HSN') || '').trim();
-        let gstRate = parseFloat(String(getVal(r, 'GST Rate %') || getVal(r, 'GSTRate') || '0').replace(/,/g, '')) || 0;
-
-        const sMaster = tallyContext?.stockItemDetails?.find(si => si.itemName.toLowerCase() === stockItem.toLowerCase());
-        let gstRateSource: 'Stock Master' | 'User Entered' = 'User Entered';
-        if (sMaster) {
-          if (!unit) unit = sMaster.unit || '';
-          if (!hsn) hsn = sMaster.hsn || '';
-          if (gstRate === 0 && sMaster.gstRate) {
-            gstRate = parseFloat(sMaster.gstRate);
-            gstRateSource = 'Stock Master';
-          }
-        }
-
-        const cgstLedger = String(getVal(r, 'CGST Ledger') || getVal(r, 'CGSTLedger') || '').trim();
-        const cgstAmount = parseFloat(String(getVal(r, 'CGST Amount') || getVal(r, 'CGSTAmount') || '0').replace(/,/g, '')) || 0;
-
-        const sgstLedger = String(getVal(r, 'SGST Ledger') || getVal(r, 'SGSTLedger') || '').trim();
-        const sgstAmount = parseFloat(String(getVal(r, 'SGST Amount') || getVal(r, 'SGSTAmount') || '0').replace(/,/g, '')) || 0;
-
-        const igstLedger = String(getVal(r, 'IGST Ledger') || getVal(r, 'IGSTLedger') || '').trim();
-        const igstAmount = parseFloat(String(getVal(r, 'IGST Amount') || getVal(r, 'IGSTAmount') || '0').replace(/,/g, '')) || 0;
-
-        items.push({
-          stockItem,
-          description,
-          quantity,
-          unit: unit || 'NOS',
-          rate,
-          itemAmount,
-          discountPercent,
-          discountAmount,
-          taxableValue,
-          hsn,
-          gstRate,
-          cgstLedger,
-          cgstAmount,
-          sgstLedger,
-          sgstAmount,
-          igstLedger,
-          igstAmount,
-          gstRateSource
-        });
-      });
-
-      const firstRowGstMode = String(getVal(firstRow, 'GST Mode') || getVal(firstRow, 'GSTMode') || 'Auto').trim() as 'Auto' | 'Manual';
-
-      const inv: SalesPurchaseInvoice = {
-        voucherType: vType,
-        invoiceDate: invDate,
-        invoiceNo: invNo,
-        partyLedger,
-        salesPurchaseLedger,
-        narration,
-        reference,
-        dispatchDate,
-        deliveryNoteNo,
-        dispatchDocNo,
-        biltyLRNo,
-        transporterName,
-        transporterGSTIN,
-        vehicleNo,
-        destination,
-        modeOfTransport,
-        ewayBillNo,
-        partyGSTIN,
-        partyAddress1,
-        partyAddress2,
-        partyState,
-        placeOfSupply,
-        partyRegistrationType,
-        items,
-        gstMode: firstRowGstMode === 'Manual' ? 'Manual' : 'Auto',
-        freightLedger,
-        freightAmount,
-        packingLedger,
-        packingAmount,
-        loadingLedger,
-        loadingAmount,
-        insuranceLedger,
-        insuranceAmount,
-        otherLedger1,
-        otherAmount1,
-        otherLedger2,
-        otherAmount2,
-        discountLedger,
-        billDiscountAmount,
-        roundOffLedger,
-        roundOffAmount,
-        totalTaxableValue: 0,
-        totalCGST: 0,
-        totalSGST: 0,
-        totalIGST: 0,
-        totalAdditionalCharges: 0,
-        invoiceTotal: 0,
-        errors: [],
-        warnings: [],
-        isValid: true
-      };
-
-      parsedInvoices.push(inv);
-    });
-
-    return parsedInvoices;
+    return parseSalesPurchaseExcel(jsonData, 'standard_itemwise') as unknown as SalesPurchaseInvoice[];
   };
 
   const recalculateInvoice = (inv: SalesPurchaseInvoice, currentCompanyState: string) => {
@@ -626,22 +400,26 @@ export default function App() {
       }
 
       inv.items.forEach((item, itemIdx) => {
-        const itemPrefix = `Item ${itemIdx + 1} (${item.stockItem}):`;
-        const iExists = tallyContext.stockItems?.some(s => s.toLowerCase() === item.stockItem.toLowerCase());
-        if (!iExists) {
-          warnings.push(`${itemPrefix} Stock Item not found in Tally masters.`);
-        }
-
-        // Auto-resolve empty HSN from stock item details in context
-        if (!item.hsn && tallyContext?.stockItemDetails) {
-          const sMaster = tallyContext.stockItemDetails.find(sm => sm.itemName.toLowerCase() === item.stockItem.toLowerCase());
-          if (sMaster && sMaster.hsn) {
-            item.hsn = sMaster.hsn;
+        const isAccountingMode = inv.voucherMode === 'Accounting';
+        const itemPrefix = isAccountingMode ? `Ledger Line ${itemIdx + 1}:` : `Item ${itemIdx + 1} (${item.stockItem}):`;
+        
+        if (!isAccountingMode) {
+          const iExists = tallyContext.stockItems?.some(s => s.toLowerCase() === item.stockItem.toLowerCase());
+          if (!iExists) {
+            warnings.push(`${itemPrefix} Stock Item not found in Tally masters.`);
           }
-        }
 
-        if (!item.hsn || !item.hsn.trim()) {
-          errors.push(`${itemPrefix} HSN/SAC is blank. A valid HSN/SAC is mandatory for GST reporting.`);
+          // Auto-resolve empty HSN from stock item details in context
+          if (!item.hsn && tallyContext?.stockItemDetails) {
+            const sMaster = tallyContext.stockItemDetails.find(sm => sm.itemName.toLowerCase() === item.stockItem.toLowerCase());
+            if (sMaster && sMaster.hsn) {
+              item.hsn = sMaster.hsn;
+            }
+          }
+
+          if (!item.hsn || !item.hsn.trim()) {
+            errors.push(`${itemPrefix} HSN/SAC is blank. A valid HSN/SAC is mandatory for GST reporting.`);
+          }
         }
 
         if (item.cgstAmount > 0 && !item.cgstLedger) {
@@ -725,6 +503,20 @@ export default function App() {
   const isResettingWorkspaceRef = useRef(false);
   const [showAllLedgers, setShowAllLedgers] = useState(false);
   const [activeGuideField, setActiveGuideField] = useState<string | null>(null);
+
+  // Missing Masters States
+  const [missingLedgers, setMissingLedgers] = useState<MissingLedgerItem[]>([]);
+  const [missingStockItems, setMissingStockItems] = useState<MissingStockItem[]>([]);
+  const [showMissingMastersReview, setShowMissingMastersReview] = useState(false);
+  const [pendingExportType, setPendingExportType] = useState<'Vouchers' | 'SalesPurchase' | null>(null);
+
+  const handleUpdateLedger = (id: string, updates: Partial<MissingLedgerItem>) => {
+    setMissingLedgers(prev => prev.map(l => l.id === id ? { ...l, ...updates } : l));
+  };
+
+  const handleUpdateStockItem = (id: string, updates: Partial<MissingStockItem>) => {
+    setMissingStockItems(prev => prev.map(i => i.id === id ? { ...i, ...updates } : i));
+  };
 
   // Bank Statement Import States
   const [voucherImportMethod, setVoucherImportMethod] = useState<'template' | 'bankStatement'>('template');
@@ -967,44 +759,146 @@ export default function App() {
     return XLSX.utils.json_to_sheet(rows, { header: keys });
   };
 
+  const colNumToLetter = (col: number): string => {
+    let temp = '';
+    let letter = '';
+    while (col > 0) {
+      temp = String.fromCharCode(((col - 1) % 26) + 65);
+      letter = temp + letter;
+      col = Math.floor((col - 1) / 26);
+    }
+    return letter;
+  };
+
+  const applyDropdownByHeader = (
+    worksheet: ExcelJS.Worksheet,
+    headers: string[],
+    headerName: string,
+    validation: ExcelJS.DataValidation
+  ) => {
+    const colIndex = headers.findIndex(h => h.toLowerCase().trim() === headerName.toLowerCase().trim()) + 1;
+    if (colIndex <= 0) return;
+    const colLetter = colNumToLetter(colIndex);
+    for (let r = 2; r <= 1000; r++) {
+      worksheet.getCell(`${colLetter}${r}`).dataValidation = validation;
+    }
+  };
+
   const downloadTemplate = async (type: string) => {
-    if (type === 'Sales' || type === 'Purchase') {
-      const isSales = type === 'Sales';
-      const headers = [
+    const isSalesMode = type.toLowerCase().includes('sales');
+    const isPurchaseMode = type.toLowerCase().includes('purchase');
+    const isSalesPurchase = isSalesMode || isPurchaseMode;
+
+    if (isSalesPurchase) {
+      const realVoucherType = isSalesMode ? 'Sales' : 'Purchase';
+      const isVoucherwise = type.toLowerCase().includes('voucherwise');
+      const isSales = isSalesMode;
+      const headers = isVoucherwise ? [
+        'Invoice Date', 'Invoice No', 'Voucher Type', 'Party Ledger', 'Party GSTIN', 'Place of Supply',
+        'Sales/Purchase Ledger', 'Taxable Value (Purchase Value)', 'GST Mode', 'GST Rate %',
+        'CGST Ledger', 'CGST Amount', 'SGST Ledger', 'SGST Amount', 'IGST Ledger', 'IGST Amount',
+        'Other Ledger 1', 'Other Amount 1', 'Round Off Ledger', 'Round Off Amount',
+        'Stock Item', 'Description', 'Quantity', 'Unit', 'Rate', 'Item Amount', 'Discount %', 'HSN/SAC',
+        'Party Address 1', 'Party Address 2', 'Party State',
+        'Dispatch Date', 'Delivery Note No', 'Dispatch Doc No', 'Bilty LR No', 'Transporter Name', 'Transporter GSTIN', 'Vehicle No', 'Destination', 'Mode of Transport', 'Eway Bill No',
+        'Freight Ledger', 'Freight Amount', 'Packing Ledger', 'Packing Amount', 'Loading Ledger', 'Loading Amount', 'Insurance Ledger', 'Insurance Amount',
+        'Other Ledger 2', 'Other Amount 2', 'Discount Ledger', 'Bill Discount Amount',
+        'Narration', 'Reference', 'Voucher Mode', 'Inventory Mode'
+      ] : [
         'Invoice Date', 'Invoice No', 'Voucher Type', 'Party Ledger', 'Sales/Purchase Ledger',
         'Stock Item', 'Description', 'Quantity', 'Unit', 'Rate', 'Item Amount', 'Discount %', 'Taxable Value', 'HSN/SAC',
         'Party GSTIN', 'Party Address 1', 'Party Address 2', 'Party State', 'Place of Supply',
         'Dispatch Date', 'Delivery Note No', 'Dispatch Doc No', 'Bilty LR No', 'Transporter Name', 'Transporter GSTIN', 'Vehicle No', 'Destination', 'Mode of Transport', 'Eway Bill No',
         'GST Mode', 'GST Rate %', 'CGST Ledger', 'CGST Amount', 'SGST Ledger', 'SGST Amount', 'IGST Ledger', 'IGST Amount',
         'Freight Ledger', 'Freight Amount', 'Packing Ledger', 'Packing Amount', 'Loading Ledger', 'Loading Amount', 'Insurance Ledger', 'Insurance Amount', 'Other Ledger 1', 'Other Amount 1', 'Other Ledger 2', 'Other Amount 2', 'Discount Ledger', 'Bill Discount Amount', 'Round Off Ledger', 'Round Off Amount',
-        'Narration', 'Reference'
+        'Narration', 'Reference', 'Voucher Mode', 'Inventory Mode'
       ];
 
-      const sampleData = [
+      const sampleData = isVoucherwise ? [
+        {
+          'Invoice Date': new Date().toLocaleDateString('en-GB'),
+          'Invoice No': 'INV-2001',
+          'Voucher Type': realVoucherType,
+          'Party Ledger': isSales ? 'Cash-in-hand' : 'Sundry Creditors',
+          'Party GSTIN': '27ABCDE1234F1Z5',
+          'Place of Supply': 'Maharashtra',
+          'Sales/Purchase Ledger': isSales ? 'Sales Account' : 'Purchase Account',
+          'Taxable Value (Purchase Value)': 10000,
+          'GST Mode': 'Auto',
+          'GST Rate %': 18,
+          'CGST Ledger': isSales ? 'CGST Output 9%' : 'CGST Input 9%',
+          'CGST Amount': '',
+          'SGST Ledger': isSales ? 'SGST Output 9%' : 'SGST Input 9%',
+          'SGST Amount': '',
+          'IGST Ledger': '',
+          'IGST Amount': '',
+          'Other Ledger 1': '',
+          'Other Amount 1': '',
+          'Round Off Ledger': 'Round Off A/c',
+          'Round Off Amount': '0.00',
+          'Stock Item': '',
+          'Description': '',
+          'Quantity': '',
+          'Unit': '',
+          'Rate': '',
+          'Item Amount': '',
+          'Discount %': '',
+          'HSN/SAC': '',
+          'Party Address 1': '456 Commercial Street',
+          'Party Address 2': 'Business Park',
+          'Party State': 'Maharashtra',
+          'Dispatch Date': '',
+          'Delivery Note No': '',
+          'Dispatch Doc No': '',
+          'Bilty LR No': '',
+          'Transporter Name': '',
+          'Transporter GSTIN': '',
+          'Vehicle No': '',
+          'Destination': '',
+          'Mode of Transport': '',
+          'Eway Bill No': '',
+          'Freight Ledger': '',
+          'Freight Amount': '',
+          'Packing Ledger': '',
+          'Packing Amount': '',
+          'Loading Ledger': '',
+          'Loading Amount': '',
+          'Insurance Ledger': '',
+          'Insurance Amount': '',
+          'Other Ledger 2': '',
+          'Other Amount 2': '',
+          'Discount Ledger': '',
+          'Bill Discount Amount': '',
+          'Narration': `${realVoucherType} voucher entry generated via TallyGen Pro (Voucherwise)`,
+          'Reference': 'REF-2001',
+          'Voucher Mode': 'Accounting',
+          'Inventory Mode': 'Inventory Optional'
+        }
+      ] : [
         {
           'Invoice Date': new Date().toLocaleDateString('en-GB'),
           'Invoice No': 'INV-1001',
-          'Voucher Type': type,
+          'Voucher Type': realVoucherType,
           'Party Ledger': isSales ? 'Cash-in-hand' : 'Sundry Creditors',
           'Sales/Purchase Ledger': isSales ? 'Sales Account' : 'Purchase Account',
           'Stock Item': 'Sample Stock Item',
-          'Description': 'High-quality item',
+          'Description': 'Item 1 description',
           'Quantity': '10',
           'Unit': 'NOS',
-          'Rate': '150',
-          'Item Amount': '1500',
-          'Discount %': '0',
-          'Taxable Value': '1500',
-          'HSN/SAC': '8517',
+          'Rate': '500',
+          'Item Amount': '5000',
+          'Discount %': '5',
+          'Taxable Value': '4750',
+          'HSN/SAC': '8471',
           'Party GSTIN': '27ABCDE1234F1Z5',
-          'Party Address 1': '123 Business Lane',
-          'Party Address 2': 'Industrial Park',
+          'Party Address 1': '123 Tech Park',
+          'Party Address 2': 'Industrial Area',
           'Party State': 'Maharashtra',
           'Place of Supply': 'Maharashtra',
-          'Dispatch Date': new Date().toLocaleDateString('en-GB'),
-          'Delivery Note No': 'DN-505',
-          'Dispatch Doc No': 'DDN-808',
-          'Bilty LR No': 'LR-9099',
+          'Dispatch Date': '',
+          'Delivery Note No': '',
+          'Dispatch Doc No': '',
+          'Bilty LR No': '',
           'Transporter Name': 'Express Cargo',
           'Transporter GSTIN': '27ABCDE1234F1Z5',
           'Vehicle No': 'MH-12-PQ-9999',
@@ -1013,9 +907,9 @@ export default function App() {
           'Eway Bill No': '123456789012',
           'GST Mode': 'Auto',
           'GST Rate %': '18',
-          'CGST Ledger': 'CGST Output 9%',
+          'CGST Ledger': isSales ? 'CGST Output 9%' : 'CGST Input 9%',
           'CGST Amount': '',
-          'SGST Ledger': 'SGST Output 9%',
+          'SGST Ledger': isSales ? 'SGST Output 9%' : 'SGST Input 9%',
           'SGST Amount': '',
           'IGST Ledger': '',
           'IGST Amount': '',
@@ -1035,13 +929,15 @@ export default function App() {
           'Bill Discount Amount': '',
           'Round Off Ledger': 'Round Off A/c',
           'Round Off Amount': '0.50',
-          'Narration': `${type} invoice generated via TallyGen Pro`,
-          'Reference': 'REF-1001'
+          'Narration': `${realVoucherType} invoice generated via TallyGen Pro (Itemwise)`,
+          'Reference': 'REF-1001',
+          'Voucher Mode': 'Item Invoice',
+          'Inventory Mode': 'Inventory Optional'
         },
         {
           'Invoice Date': new Date().toLocaleDateString('en-GB'),
           'Invoice No': 'INV-1001',
-          'Voucher Type': type,
+          'Voucher Type': realVoucherType,
           'Party Ledger': isSales ? 'Cash-in-hand' : 'Sundry Creditors',
           'Sales/Purchase Ledger': isSales ? 'Sales Account' : 'Purchase Account',
           'Stock Item': 'Another Stock Item',
@@ -1054,32 +950,32 @@ export default function App() {
           'Taxable Value': '1350',
           'HSN/SAC': '8518',
           'Party GSTIN': '27ABCDE1234F1Z5',
-          'Party Address 1': '123 Business Lane',
-          'Party Address 2': 'Industrial Park',
+          'Party Address 1': '123 Tech Park',
+          'Party Address 2': 'Industrial Area',
           'Party State': 'Maharashtra',
           'Place of Supply': 'Maharashtra',
           'Dispatch Date': '',
           'Delivery Note No': '',
           'Dispatch Doc No': '',
           'Bilty LR No': '',
-          'Transporter Name': '',
-          'Transporter GSTIN': '',
-          'Vehicle No': '',
-          'Destination': '',
-          'Mode of Transport': '',
-          'Eway Bill No': '',
+          'Transporter Name': 'Express Cargo',
+          'Transporter GSTIN': '27ABCDE1234F1Z5',
+          'Vehicle No': 'MH-12-PQ-9999',
+          'Destination': 'Warehouse A',
+          'Mode of Transport': 'Road',
+          'Eway Bill No': '123456789012',
           'GST Mode': 'Auto',
-          'GST Rate %': '12',
-          'CGST Ledger': 'CGST Output 6%',
+          'GST Rate %': '18',
+          'CGST Ledger': isSales ? 'CGST Output 9%' : 'CGST Input 9%',
           'CGST Amount': '',
-          'SGST Ledger': 'SGST Output 6%',
+          'SGST Ledger': isSales ? 'SGST Output 9%' : 'SGST Input 9%',
           'SGST Amount': '',
           'IGST Ledger': '',
           'IGST Amount': '',
-          'Freight Ledger': '',
-          'Freight Amount': '',
-          'Packing Ledger': '',
-          'Packing Amount': '',
+          'Freight Ledger': 'Freight Charges',
+          'Freight Amount': '100',
+          'Packing Ledger': 'Packing Expenses',
+          'Packing Amount': '50',
           'Loading Ledger': '',
           'Loading Amount': '',
           'Insurance Ledger': '',
@@ -1090,23 +986,30 @@ export default function App() {
           'Other Amount 2': '',
           'Discount Ledger': '',
           'Bill Discount Amount': '',
-          'Round Off Ledger': '',
-          'Round Off Amount': '',
-          'Narration': '',
-          'Reference': ''
+          'Round Off Ledger': 'Round Off A/c',
+          'Round Off Amount': '0.50',
+          'Narration': `${realVoucherType} invoice generated via TallyGen Pro (Itemwise)`,
+          'Reference': 'REF-1001',
+          'Voucher Mode': 'Item Invoice',
+          'Inventory Mode': 'Inventory Optional'
         }
       ];
 
       const wb = new ExcelJS.Workbook();
       const templateSheet = wb.addWorksheet('Template');
-      templateSheet.getRow(1).values = headers;
-      sampleData.forEach(row => {
-        const rowValues = headers.map(h => row[h as keyof typeof row] !== undefined ? row[h as keyof typeof row] : '');
-        templateSheet.addRow(rowValues);
-      });
+      const mastersSheet = wb.addWorksheet('Tally_Masters');
 
-      // Prepare lists
-      const voucherTypes = ['Sales', 'Purchase'];
+      mastersSheet.views = [{ showGridLines: false }];
+      mastersSheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFF' } };
+      mastersSheet.getRow(1).fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: '414141' }
+      };
+
+      const DEFAULT_LEDGERS = ['Sundry Debtors', 'Sundry Creditors', 'Sales Account', 'Purchase Account', 'Cash-in-hand', 'CGST Output 9%', 'SGST Output 9%', 'CGST Input 9%', 'SGST Input 9%', 'Freight Charges', 'Packing Expenses', 'Round Off A/c'];
+      const DEFAULT_UNITS = ['NOS', 'PCS', 'KG', 'BOX', 'SET', 'MTR'];
+
       const ledgersList = (tallyContext && tallyContext.ledgers && tallyContext.ledgers.length > 0)
         ? tallyContext.ledgers
         : DEFAULT_LEDGERS;
@@ -1154,10 +1057,9 @@ export default function App() {
       ];
 
       const finalTransportModes = ['Road', 'Rail', 'Air', 'Ship'];
+      const voucherTypes = ['Payment', 'Receipt', 'Contra', 'Journal', 'Sales', 'Purchase'];
 
-      // Hidden masters sheet
-      const mastersSheet = wb.addWorksheet('Tally_Masters');
-      mastersSheet.state = 'hidden';
+      // Set headers on Tally_Masters
       mastersSheet.getRow(1).values = [
         'Voucher_Type',
         'Party_Ledger',
@@ -1199,136 +1101,158 @@ export default function App() {
         ];
       }
 
-      // Apply validations
-      for (let r = 2; r <= 100; r++) {
-        // C: Voucher Type -> Col A of Tally_Masters
-        templateSheet.getCell(`C${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$A$2:$A$${voucherTypes.length + 1}`]
-        };
-        // D: Party Ledger -> Col B of Tally_Masters
-        templateSheet.getCell(`D${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$B$2:$B$${ledgersList.length + 1}`]
-        };
-        // E: Sales/Purchase Ledger -> Col C of Tally_Masters
-        templateSheet.getCell(`E${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$C$2:$C$${finalSalesPurchaseLedgers.length + 1}`]
-        };
-        // F: Stock Item -> Col D of Tally_Masters
-        templateSheet.getCell(`F${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$D$2:$D$${stockList.length + 1}`]
-        };
-        // I: Unit -> Col E of Tally_Masters
-        templateSheet.getCell(`I${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$E$2:$E$${unitsList.length + 1}`]
-        };
-        // R: Party State -> Col I of Tally_Masters
-        templateSheet.getCell(`R${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$I$2:$I$${finalStates.length + 1}`]
-        };
-        // S: Place of Supply -> Col I of Tally_Masters
-        templateSheet.getCell(`S${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$I$2:$I$${finalStates.length + 1}`]
-        };
-        // AB: Mode of Transport -> Col J of Tally_Masters
-        templateSheet.getCell(`AB${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$J$2:$J$${finalTransportModes.length + 1}`]
-        };
-        // AD: GST Mode -> Auto, Manual
-        templateSheet.getCell(`AD${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: ['"Auto,Manual"']
-        };
-        // AF: CGST Ledger -> Col F of Tally_Masters
-        templateSheet.getCell(`AF${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$F$2:$F$${finalGstLedgers.length + 1}`]
-        };
-        // AH: SGST Ledger -> Col F of Tally_Masters
-        templateSheet.getCell(`AH${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$F$2:$F$${finalGstLedgers.length + 1}`]
-        };
-        // AJ: IGST Ledger -> Col F of Tally_Masters
-        templateSheet.getCell(`AJ${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$F$2:$F$${finalGstLedgers.length + 1}`]
-        };
-        // AL: Freight Ledger -> Col G of Tally_Masters
-        templateSheet.getCell(`AL${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
-        };
-        // AN: Packing Ledger -> Col G of Tally_Masters
-        templateSheet.getCell(`AN${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
-        };
-        // AP: Loading Ledger -> Col G of Tally_Masters
-        templateSheet.getCell(`AP${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
-        };
-        // AR: Insurance Ledger -> Col G of Tally_Masters
-        templateSheet.getCell(`AR${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
-        };
-        // AT: Other Ledger 1 -> Col G of Tally_Masters
-        templateSheet.getCell(`AT${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
-        };
-        // AV: Other Ledger 2 -> Col G of Tally_Masters
-        templateSheet.getCell(`AV${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
-        };
-        // AX: Discount Ledger -> Col G of Tally_Masters
-        templateSheet.getCell(`AX${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
-        };
-        // AZ: Round Off Ledger -> Col H of Tally_Masters
-        templateSheet.getCell(`AZ${r}`).dataValidation = {
-          type: 'list',
-          allowBlank: true,
-          formulae: [`Tally_Masters!$H$2:$H$${finalRoundOffLedgers.length + 1}`]
-        };
-      }
+      // Populate Template sheet
+      templateSheet.getRow(1).values = headers;
+      templateSheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFF' } };
+      templateSheet.getRow(1).fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: '1F2937' }
+      };
+
+      sampleData.forEach(row => {
+        const rowValues = headers.map(h => row[h as keyof typeof row] !== undefined ? row[h as keyof typeof row] : '');
+        templateSheet.addRow(rowValues);
+      });
+
+      // Apply dropdown validations using applyDropdownByHeader
+      applyDropdownByHeader(templateSheet, headers, 'Voucher Type', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$A$2:$A$${voucherTypes.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'Party Ledger', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$B$2:$B$${ledgersList.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'Sales/Purchase Ledger', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$C$2:$C$${finalSalesPurchaseLedgers.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'Stock Item', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$D$2:$D$${stockList.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'Unit', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$E$2:$E$${unitsList.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'Party State', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$I$2:$I$${finalStates.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'Place of Supply', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$I$2:$I$${finalStates.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'Mode of Transport', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$J$2:$J$${finalTransportModes.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'GST Mode', {
+        type: 'list',
+        allowBlank: true,
+        formulae: ['"Auto,Manual"']
+      });
+      applyDropdownByHeader(templateSheet, headers, 'CGST Ledger', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$F$2:$F$${finalGstLedgers.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'SGST Ledger', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$F$2:$F$${finalGstLedgers.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'IGST Ledger', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$F$2:$F$${finalGstLedgers.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'Freight Ledger', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'Packing Ledger', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'Loading Ledger', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'Insurance Ledger', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'Other Ledger 1', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'Other Ledger 2', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'Discount Ledger', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$G$2:$G$${finalAdditionalLedgers.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'Round Off Ledger', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$H$2:$H$${finalRoundOffLedgers.length + 1}`]
+      });
+      applyDropdownByHeader(templateSheet, headers, 'Voucher Mode', {
+        type: 'list',
+        allowBlank: true,
+        formulae: ['"Auto,Item Invoice,Accounting"']
+      });
+      applyDropdownByHeader(templateSheet, headers, 'Inventory Mode', {
+        type: 'list',
+        allowBlank: true,
+        formulae: ['"No Inventory,Inventory Optional,Inventory Mandatory"']
+      });
+
+      // Auto-adjust column widths for Template Sheet
+      templateSheet.columns.forEach(col => {
+        let maxLen = 0;
+        col.eachCell({ includeEmpty: true }, (cell) => {
+          const valStr = cell.value ? String(cell.value) : '';
+          if (valStr.length > maxLen) maxLen = valStr.length;
+        });
+        col.width = Math.max(maxLen + 3, 12);
+      });
+
+      // Auto-adjust column widths for Tally_Masters
+      mastersSheet.columns.forEach(col => {
+        let maxLen = 0;
+        col.eachCell({ includeEmpty: true }, (cell) => {
+          const valStr = cell.value ? String(cell.value) : '';
+          if (valStr.length > maxLen) maxLen = valStr.length;
+        });
+        col.width = Math.max(maxLen + 3, 15);
+      });
 
       const buffer = await wb.xlsx.writeBuffer();
       const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `Tally_${type}_Invoice_Template.xlsx`;
+      a.download = `Tally_${realVoucherType}_${isVoucherwise ? 'Voucherwise' : 'Itemwise'}_Template.xlsx`;
       a.click();
       window.URL.revokeObjectURL(url);
       return;
@@ -3858,8 +3782,314 @@ export default function App() {
     }
   };
 
-  const generateFinalXMLFromVerification = async () => {
-    if (!user || verificationRows.length === 0) return;
+  const buildMissingMastersXMLs = () => {
+    let groupsXml = '';
+    let unitsXml = '';
+    let stockGroupsXml = '';
+    let ledgersXml = '';
+    let stockItemsXml = '';
+
+    const groupsCreated = new Set<string>();
+    const unitsCreated = new Set<string>();
+    const stockGroupsCreated = new Set<string>();
+
+    // 1. Groups
+    missingLedgers.forEach(ml => {
+      if (ml.action === 'Create' && ml.proposedGroup) {
+        const gp = ml.proposedGroup;
+        const gpLower = gp.toLowerCase();
+        const existsInTally = tallyContext?.groups?.some(g => g.toLowerCase() === gpLower);
+        if (!existsInTally && !groupsCreated.has(gpLower)) {
+          groupsCreated.add(gpLower);
+          groupsXml += generateGroupMasterXML(gp, 'Suspense A/c') + '\n';
+        }
+      }
+    });
+
+    // 2. Units
+    missingStockItems.forEach(ms => {
+      if (ms.action === 'Create' && ms.unit) {
+        const u = ms.unit;
+        const uLower = u.toLowerCase();
+        const existsInTally = tallyContext?.units?.some(un => un.toLowerCase() === uLower);
+        if (!existsInTally && !unitsCreated.has(uLower)) {
+          unitsCreated.add(uLower);
+          unitsXml += generateUnitMasterXML(u) + '\n';
+        }
+      }
+    });
+
+    // 3. Stock Groups
+    missingStockItems.forEach(ms => {
+      if (ms.action === 'Create' && ms.proposedStockGroup) {
+        const sg = ms.proposedStockGroup;
+        const sgLower = sg.toLowerCase();
+        const existsInTally = tallyContext?.stockGroups?.some(s => s.toLowerCase() === sgLower);
+        if (!existsInTally && !stockGroupsCreated.has(sgLower)) {
+          stockGroupsCreated.add(sgLower);
+          stockGroupsXml += generateStockGroupMasterXML(sg) + '\n';
+        }
+      }
+    });
+
+    // 4. Ledgers
+    ledgersXml = generateMissingLedgerMastersXML(missingLedgers);
+
+    // 5. Stock Items
+    stockItemsXml = generateMissingStockItemMastersXML(missingStockItems);
+
+    return { groupsXml, unitsXml, stockGroupsXml, ledgersXml, stockItemsXml };
+  };
+
+  const getReviewedVouchers = () => {
+    const nameMap: Record<string, string> = {};
+    missingLedgers.forEach(ml => {
+      const key = ml.name.toLowerCase();
+      if (ml.action === 'Replace' && ml.replacementName) {
+        nameMap[key] = ml.replacementName;
+      } else if (ml.action === 'Create' && ml.name) {
+        nameMap[key] = ml.name;
+      }
+    });
+
+    return verificationRows.map(row => {
+      const updated = { ...row };
+      const flKey = (updated.finalLedger || '').toLowerCase();
+      const blKey = (updated.bankLedger || '').toLowerCase();
+      if (nameMap[flKey]) {
+        updated.finalLedger = nameMap[flKey];
+      }
+      if (nameMap[blKey]) {
+        updated.bankLedger = nameMap[blKey];
+      }
+      return updated;
+    });
+  };
+
+  const getReviewedInvoices = () => {
+    const nameMap: Record<string, string> = {};
+    missingLedgers.forEach(ml => {
+      const key = ml.name.toLowerCase();
+      if (ml.action === 'Replace' && ml.replacementName) {
+        nameMap[key] = ml.replacementName;
+      } else if (ml.action === 'Create' && ml.name) {
+        nameMap[key] = ml.name;
+      }
+    });
+
+    const stockMap: Record<string, string> = {};
+    missingStockItems.forEach(ms => {
+      const key = ms.name.toLowerCase();
+      if (ms.action === 'Replace' && ms.replacementName) {
+        stockMap[key] = ms.replacementName;
+      } else if (ms.action === 'Create' && ms.name) {
+        stockMap[key] = ms.name;
+      }
+    });
+
+    return salesPurchaseInvoices.map(inv => {
+      const updated = JSON.parse(JSON.stringify(inv)) as SalesPurchaseInvoice;
+      const plKey = (updated.partyLedger || '').toLowerCase();
+      const splKey = (updated.salesPurchaseLedger || '').toLowerCase();
+      if (nameMap[plKey]) updated.partyLedger = nameMap[plKey];
+      if (nameMap[splKey]) updated.salesPurchaseLedger = nameMap[splKey];
+
+      if (updated.freightLedger && nameMap[updated.freightLedger.toLowerCase()]) {
+        updated.freightLedger = nameMap[updated.freightLedger.toLowerCase()];
+      }
+      if (updated.packingLedger && nameMap[updated.packingLedger.toLowerCase()]) {
+        updated.packingLedger = nameMap[updated.packingLedger.toLowerCase()];
+      }
+      if (updated.loadingLedger && nameMap[updated.loadingLedger.toLowerCase()]) {
+        updated.loadingLedger = nameMap[updated.loadingLedger.toLowerCase()];
+      }
+      if (updated.insuranceLedger && nameMap[updated.insuranceLedger.toLowerCase()]) {
+        updated.insuranceLedger = nameMap[updated.insuranceLedger.toLowerCase()];
+      }
+      if (updated.otherLedger1 && nameMap[updated.otherLedger1.toLowerCase()]) {
+        updated.otherLedger1 = nameMap[updated.otherLedger1.toLowerCase()];
+      }
+      if (updated.otherLedger2 && nameMap[updated.otherLedger2.toLowerCase()]) {
+        updated.otherLedger2 = nameMap[updated.otherLedger2.toLowerCase()];
+      }
+      if (updated.discountLedger && nameMap[updated.discountLedger.toLowerCase()]) {
+        updated.discountLedger = nameMap[updated.discountLedger.toLowerCase()];
+      }
+      if (updated.roundOffLedger && nameMap[updated.roundOffLedger.toLowerCase()]) {
+        updated.roundOffLedger = nameMap[updated.roundOffLedger.toLowerCase()];
+      }
+
+      updated.items.forEach(item => {
+        const siKey = (item.stockItem || '').toLowerCase();
+        if (stockMap[siKey]) item.stockItem = stockMap[siKey];
+
+        if (item.cgstLedger && nameMap[item.cgstLedger.toLowerCase()]) {
+          item.cgstLedger = nameMap[item.cgstLedger.toLowerCase()];
+        }
+        if (item.sgstLedger && nameMap[item.sgstLedger.toLowerCase()]) {
+          item.sgstLedger = nameMap[item.sgstLedger.toLowerCase()];
+        }
+        if (item.igstLedger && nameMap[item.igstLedger.toLowerCase()]) {
+          item.igstLedger = nameMap[item.igstLedger.toLowerCase()];
+        }
+      });
+
+      return updated;
+    });
+  };
+
+  const validateReview = (): string[] => {
+    const errs: string[] = [];
+
+    // Rule 1: Missing ledger action = Create but proposed group is blank
+    missingLedgers.forEach(l => {
+      if (l.action === 'Create' && !l.proposedGroup.trim()) {
+        errs.push(`Ledger "${l.name}": Proposed Group cannot be blank.`);
+      }
+    });
+
+    // Rule 2 & 3: Missing stock item action = Create but unit/hsn is blank
+    missingStockItems.forEach(i => {
+      if (i.action === 'Create') {
+        if (!i.unit.trim()) {
+          errs.push(`Stock Item "${i.name}": Unit is required.`);
+        }
+        if (!i.hsn.trim()) {
+          errs.push(`Stock Item "${i.name}": HSN/SAC is required.`);
+        }
+        if (i.gstRate === undefined || isNaN(i.gstRate)) {
+          errs.push(`Stock Item "${i.name}": GST Rate must be a valid number.`);
+        }
+      }
+    });
+
+    // Rule 4: Replace action selected but replacement master not selected
+    missingLedgers.forEach(l => {
+      if (l.action === 'Replace' && !l.replacementName) {
+        errs.push(`Ledger "${l.name}": Replacement master ledger is not selected.`);
+      }
+    });
+    missingStockItems.forEach(i => {
+      if (i.action === 'Replace' && !i.replacementName) {
+        errs.push(`Stock Item "${i.name}": Replacement stock item is not selected.`);
+      }
+    });
+
+    // Rule 5: Missing master is ignored but still used in voucher XML
+    missingLedgers.forEach(l => {
+      if (l.action === 'Ignore') {
+        errs.push(`Ledger "${l.name}": Cannot be ignored because it is used in final vouchers. Please select Create or Replace.`);
+      }
+    });
+    missingStockItems.forEach(i => {
+      if (i.action === 'Ignore') {
+        errs.push(`Stock Item "${i.name}": Cannot be ignored because it is used in final invoices. Please select Create or Replace.`);
+      }
+    });
+
+    return errs;
+  };
+
+  const checkMissingMastersAndProceed = (type: 'Vouchers' | 'SalesPurchase') => {
+    setError(null);
+    const ledgersList = tallyContext?.ledgers || [];
+    const stockItemsList = tallyContext?.stockItems || [];
+    const unitsList = tallyContext?.units || [];
+
+    const usedLedgers: { name: string; source: string; type: string }[] = [];
+    const usedStockItems: { name: string; source: string; unit?: string; hsn?: string; gstRate?: number }[] = [];
+
+    if (type === 'Vouchers') {
+      verificationRows.forEach((row, idx) => {
+        const rowId = row.voucherNumber ? `${row.voucherType} No: ${row.voucherNumber}` : `${row.voucherType} Row ${idx + 1}`;
+        if (row.finalLedger) {
+          usedLedgers.push({ name: row.finalLedger, source: rowId, type: 'Party Ledger' });
+        }
+        if (row.bankLedger) {
+          usedLedgers.push({ name: row.bankLedger, source: rowId, type: 'Bank/Cash Ledger' });
+        } else if (selectedBankLedger) {
+          usedLedgers.push({ name: selectedBankLedger, source: rowId, type: 'Bank/Cash Ledger' });
+        }
+      });
+    } else {
+      salesPurchaseInvoices.forEach((inv, idx) => {
+        const invId = inv.invoiceNo ? `${inv.voucherType} No: ${inv.invoiceNo}` : `${inv.voucherType} Row ${idx + 1}`;
+        if (inv.partyLedger) {
+          usedLedgers.push({ name: inv.partyLedger, source: invId, type: 'Party Ledger' });
+        }
+        if (inv.salesPurchaseLedger) {
+          usedLedgers.push({ name: inv.salesPurchaseLedger, source: invId, type: 'Sales/Purchase Ledger' });
+        }
+        if (inv.freightAmount && inv.freightLedger) {
+          usedLedgers.push({ name: inv.freightLedger, source: invId, type: 'Freight Ledger' });
+        }
+        if (inv.packingAmount && inv.packingLedger) {
+          usedLedgers.push({ name: inv.packingLedger, source: invId, type: 'Packing Ledger' });
+        }
+        if (inv.loadingAmount && inv.loadingLedger) {
+          usedLedgers.push({ name: inv.loadingLedger, source: invId, type: 'Loading Ledger' });
+        }
+        if (inv.insuranceAmount && inv.insuranceLedger) {
+          usedLedgers.push({ name: inv.insuranceLedger, source: invId, type: 'Insurance Ledger' });
+        }
+        if (inv.otherAmount1 && inv.otherLedger1) {
+          usedLedgers.push({ name: inv.otherLedger1, source: invId, type: 'Other Ledger 1' });
+        }
+        if (inv.otherAmount2 && inv.otherLedger2) {
+          usedLedgers.push({ name: inv.otherLedger2, source: invId, type: 'Other Ledger 2' });
+        }
+        if (inv.billDiscountAmount && inv.discountLedger) {
+          usedLedgers.push({ name: inv.discountLedger, source: invId, type: 'Discount Ledger' });
+        }
+        if (inv.roundOffAmount && inv.roundOffLedger) {
+          usedLedgers.push({ name: inv.roundOffLedger, source: invId, type: 'Round Off Ledger' });
+        }
+
+        inv.items.forEach((item, itemIdx) => {
+          const itemSource = `${invId} Item ${itemIdx + 1}`;
+          if (inv.voucherMode !== 'Accounting' && item.stockItem) {
+            usedStockItems.push({
+              name: item.stockItem,
+              source: itemSource,
+              unit: item.unit,
+              hsn: item.hsn,
+              gstRate: item.gstRate
+            });
+          }
+          if (item.cgstLedger && item.cgstAmount) {
+            usedLedgers.push({ name: item.cgstLedger, source: itemSource, type: 'CGST Ledger' });
+          }
+          if (item.sgstLedger && item.sgstAmount) {
+            usedLedgers.push({ name: item.sgstLedger, source: itemSource, type: 'SGST Ledger' });
+          }
+          if (item.igstLedger && item.igstAmount) {
+            usedLedgers.push({ name: item.igstLedger, source: itemSource, type: 'IGST Ledger' });
+          }
+        });
+      });
+    }
+
+    const detectedLedgers = detectMissingLedgers(usedLedgers, ledgersList);
+    const detectedItems = detectMissingStockItems(usedStockItems, stockItemsList, unitsList);
+
+    if (detectedLedgers.length > 0 || detectedItems.length > 0) {
+      setMissingLedgers(detectedLedgers);
+      setMissingStockItems(detectedItems);
+      setPendingExportType(type);
+      setShowMissingMastersReview(true);
+      setIsProcessing(false);
+    } else {
+      // Proceed directly without missing masters
+      if (type === 'Vouchers') {
+        generateFinalXMLFromVerificationDirect(verificationRows);
+      } else {
+        generateSalesPurchaseXMLFromVerificationDirect(salesPurchaseInvoices);
+      }
+    }
+  };
+
+  const generateFinalXMLFromVerificationDirect = async (rowsToUse: any[], includeMasters: boolean = false) => {
+    if (!user || rowsToUse.length === 0) return;
     setIsProcessing(true);
     setError(null);
 
@@ -3874,7 +4104,7 @@ export default function App() {
       }
       const conversionId = await saveConversion(user.uid, conversionPayload);
 
-      const vouchers: TallyVoucher[] = verificationRows.map(row => {
+      const vouchers: TallyVoucher[] = rowsToUse.map(row => {
         const vType = row.voucherType;
         const amt = Math.abs(row.amount);
 
@@ -3890,9 +4120,6 @@ export default function App() {
         };
 
         if (vType === 'Receipt') {
-          // Receipt sign logic:
-          // Final Ledger: ISDEEMEDPOSITIVE = No, AMOUNT is positive (+Amount)
-          // Bank Ledger: ISDEEMEDPOSITIVE = Yes, AMOUNT is negative (-Amount)
           voucher.ledgerEntries.push({
             ledgerName: row.finalLedger,
             isDeemedPositive: 'No',
@@ -3909,9 +4136,6 @@ export default function App() {
             amount: -amt
           });
         } else {
-          // Payment sign logic:
-          // Final Ledger: ISDEEMEDPOSITIVE = Yes, AMOUNT is negative (-Amount)
-          // Bank Ledger: ISDEEMEDPOSITIVE = No, AMOUNT is positive (+Amount)
           voucher.ledgerEntries.push({
             ledgerName: row.finalLedger,
             isDeemedPositive: 'Yes',
@@ -3932,7 +4156,14 @@ export default function App() {
         return voucher;
       });
 
-      const xml = generateTallyXML(vouchers);
+      let xml = generateTallyXML(vouchers);
+      if (includeMasters) {
+        xml = generateCombinedImportXML({
+          voucherXml: xml,
+          ...buildMissingMastersXMLs()
+        });
+      }
+
       await updateConversion(user.uid, conversionId, {
         status: 'completed',
         xmlContent: xml
@@ -3950,19 +4181,20 @@ export default function App() {
       setConversions(prev => [newRecord, ...prev]);
       setCurrentStep('complete');
       setIsProcessing(false);
+      setShowMissingMastersReview(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Conversion failed");
       setIsProcessing(false);
     }
   };
 
-  const generateSalesPurchaseXMLFromVerification = async () => {
-    if (!user || salesPurchaseInvoices.length === 0) return;
+  const generateSalesPurchaseXMLFromVerificationDirect = async (invoicesToUse: SalesPurchaseInvoice[], includeMasters: boolean = false) => {
+    if (!user || invoicesToUse.length === 0) return;
     setIsProcessing(true);
     setError(null);
 
     try {
-      const errorInvoice = salesPurchaseInvoices.find(inv => !inv.isValid);
+      const errorInvoice = invoicesToUse.find(inv => !inv.isValid);
       if (errorInvoice) {
         throw new Error(`Invoice No "${errorInvoice.invoiceNo}" has errors. Please fix all errors before generating XML.`);
       }
@@ -3977,7 +4209,13 @@ export default function App() {
       }
       const conversionId = await saveConversion(user.uid, conversionPayload);
 
-      const xml = generateSalesPurchaseXML(salesPurchaseInvoices, companyState);
+      let xml = generateSalesPurchaseXML(invoicesToUse, companyState);
+      if (includeMasters) {
+        xml = generateCombinedImportXML({
+          voucherXml: xml,
+          ...buildMissingMastersXMLs()
+        });
+      }
 
       await updateConversion(user.uid, conversionId, {
         status: 'completed',
@@ -3996,10 +4234,62 @@ export default function App() {
       setConversions(prev => [newRecord, ...prev]);
       setCurrentStep('complete');
       setIsProcessing(false);
+      setShowMissingMastersReview(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Conversion failed");
       setIsProcessing(false);
     }
+  };
+
+  const downloadReviewedExcel = () => {
+    const wb = XLSX.utils.book_new();
+    if (pendingExportType === 'Vouchers') {
+      const exportRows = getReviewedVouchers().map((row, idx) => ({
+        'Date': row.date,
+        'Voucher Type': row.voucherType,
+        'Voucher No': row.voucherNumber || '',
+        'Ledger Name': row.finalLedger,
+        'Bank/Cash Ledger': row.bankLedger || selectedBankLedger || 'Bank Account',
+        'Amount': Math.abs(row.amount),
+        'Narration': row.description || '',
+        'Reference': row.reference || ''
+      }));
+      const ws = XLSX.utils.json_to_sheet(exportRows);
+      XLSX.utils.book_append_sheet(wb, ws, "Reviewed_Vouchers");
+    } else {
+      const exportRows: any[] = [];
+      getReviewedInvoices().forEach(inv => {
+        inv.items.forEach(item => {
+          exportRows.push({
+            'Invoice Date': inv.invoiceDate,
+            'Invoice No': inv.invoiceNo,
+            'Party Ledger': inv.partyLedger,
+            'Sales/Purchase Ledger': inv.salesPurchaseLedger,
+            'Place of Supply': inv.placeOfSupply || '',
+            'Stock Item': item.stockItem,
+            'Quantity': item.quantity,
+            'Unit': item.unit,
+            'Rate': item.rate,
+            'Amount': item.itemAmount,
+            'GST Rate %': item.gstRate,
+            'HSN/SAC': item.hsn || '',
+            'Narration': inv.narration || '',
+            'Reference': inv.reference || ''
+          });
+        });
+      });
+      const ws = XLSX.utils.json_to_sheet(exportRows);
+      XLSX.utils.book_append_sheet(wb, ws, "Reviewed_Sales_Purchase");
+    }
+    XLSX.writeFile(wb, `TallyGen_Reviewed_${pendingExportType}.xlsx`);
+  };
+
+  const generateFinalXMLFromVerification = async () => {
+    checkMissingMastersAndProceed('Vouchers');
+  };
+
+  const generateSalesPurchaseXMLFromVerification = async () => {
+    checkMissingMastersAndProceed('SalesPurchase');
   };
 
   const downloadXML = (content: string, fileName: string) => {
@@ -4171,7 +4461,319 @@ export default function App() {
       </header>
 
       <main className="max-w-7xl mx-auto px-4 py-8">
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        {showMissingMastersReview ? (
+          <motion.section
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="bg-white p-8 rounded-2xl border border-zinc-200 shadow-sm space-y-8"
+          >
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-zinc-100">
+              <div>
+                <h2 className="text-2xl font-bold flex items-center gap-3 text-zinc-900">
+                  <Database className="w-6 h-6 text-zinc-900" />
+                  Missing Masters Review
+                </h2>
+                <p className="text-sm text-zinc-500 mt-1">
+                  These masters are not found in uploaded Tally data. TallyGen can create them before voucher import. Please review group/unit details before downloading XML.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowMissingMastersReview(false)}
+                className="px-4 py-2 text-xs font-semibold text-zinc-500 hover:text-zinc-900 hover:bg-zinc-100 rounded-lg transition-colors"
+              >
+                Back to Verification
+              </button>
+            </div>
+
+            {/* Error alerts if any validation fails */}
+            {(() => {
+              const validationErrors = validateReview();
+              if (validationErrors.length > 0) {
+                return (
+                  <div className="p-4 bg-red-50 border border-red-200 rounded-xl space-y-2">
+                    <div className="flex items-center gap-2 text-red-800 font-semibold text-sm">
+                      <AlertCircle className="w-4 h-4 shrink-0" />
+                      <span>XML Generation Blocked (Fix errors to export)</span>
+                    </div>
+                    <ul className="list-disc list-inside text-xs text-red-700 space-y-1 pl-1">
+                      {validationErrors.map((err, i) => (
+                        <li key={i}>{err}</li>
+                      ))}
+                    </ul>
+                  </div>
+                );
+              }
+              return (
+                <div className="p-4 bg-emerald-50 border border-emerald-100 rounded-xl flex items-center gap-2.5 text-emerald-800 text-sm">
+                  <CheckCircle2 className="w-4.5 h-4.5 shrink-0 text-emerald-600" />
+                  <span className="font-medium">All reviews valid! You can now download the XML files.</span>
+                </div>
+              );
+            })()}
+
+            {/* Missing Ledgers Table */}
+            {missingLedgers.length > 0 && (
+              <div className="space-y-4">
+                <h3 className="font-bold text-zinc-800 text-base flex items-center gap-2">
+                  <span className="w-2.5 h-2.5 bg-amber-500 rounded-full"></span>
+                  Missing Ledgers ({missingLedgers.length})
+                </h3>
+                <div className="overflow-x-auto border border-zinc-200 rounded-xl">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="bg-zinc-50 border-b border-zinc-200 text-zinc-600 font-semibold">
+                        <th className="p-3">Ledger Name</th>
+                        <th className="p-3">Proposed Group</th>
+                        <th className="p-3">Source Row / Voucher</th>
+                        <th className="p-3">Type</th>
+                        <th className="p-3">Action</th>
+                        <th className="p-3">Replace With</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-zinc-100">
+                      {missingLedgers.map(l => (
+                        <tr key={l.id} className="hover:bg-zinc-50/50 transition-colors">
+                          <td className="p-3">
+                            <input
+                              type="text"
+                              value={l.name}
+                              onChange={e => handleUpdateLedger(l.id, { name: e.target.value })}
+                              className="w-full px-2 py-1 border border-zinc-200 rounded-md focus:border-zinc-900 focus:ring-1 focus:ring-zinc-900 outline-none font-medium text-zinc-800"
+                            />
+                            {l.possibleMatches.length > 0 && (
+                              <div className="text-[10px] text-amber-600 mt-1 pl-1">
+                                Possible Matches: {l.possibleMatches.join(', ')}
+                              </div>
+                            )}
+                          </td>
+                          <td className="p-3">
+                            <input
+                              type="text"
+                              value={l.proposedGroup}
+                              placeholder="Suspense"
+                              onChange={e => handleUpdateLedger(l.id, { proposedGroup: e.target.value })}
+                              className="w-full px-2 py-1 border border-zinc-200 rounded-md focus:border-zinc-900 focus:ring-1 focus:ring-zinc-900 outline-none text-zinc-700"
+                            />
+                          </td>
+                          <td className="p-3 text-zinc-500 max-w-[150px] truncate" title={l.sourceRowOrVoucher}>
+                            {l.sourceRowOrVoucher}
+                          </td>
+                          <td className="p-3">
+                            <span className="px-2 py-0.5 bg-zinc-100 text-zinc-600 rounded font-medium text-[10px]">
+                              {l.type}
+                            </span>
+                          </td>
+                          <td className="p-3">
+                            <select
+                              value={l.action}
+                              onChange={e => handleUpdateLedger(l.id, { action: e.target.value as any })}
+                              className="px-2 py-1 border border-zinc-200 rounded-md bg-white focus:border-zinc-900 focus:ring-1 focus:ring-zinc-900 outline-none font-medium"
+                            >
+                              <option value="Create">Create</option>
+                              <option value="Replace">Replace</option>
+                              <option value="Ignore">Ignore</option>
+                            </select>
+                          </td>
+                          <td className="p-3">
+                            <select
+                              value={l.replacementName}
+                              disabled={l.action !== 'Replace'}
+                              onChange={e => handleUpdateLedger(l.id, { replacementName: e.target.value })}
+                              className="w-full px-2 py-1 border border-zinc-200 rounded-md bg-white disabled:bg-zinc-50 disabled:text-zinc-400 focus:border-zinc-900 focus:ring-1 focus:ring-zinc-900 outline-none"
+                            >
+                              <option value="">-- Select Master --</option>
+                              {(tallyContext?.ledgers || []).map(m => (
+                                <option key={m} value={m}>{m}</option>
+                              ))}
+                            </select>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* Missing Stock Items Table */}
+            {missingStockItems.length > 0 && (
+              <div className="space-y-4">
+                <h3 className="font-bold text-zinc-800 text-base flex items-center gap-2">
+                  <span className="w-2.5 h-2.5 bg-rose-500 rounded-full"></span>
+                  Missing Stock Items ({missingStockItems.length})
+                </h3>
+                <div className="overflow-x-auto border border-zinc-200 rounded-xl">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="bg-zinc-50 border-b border-zinc-200 text-zinc-600 font-semibold">
+                        <th className="p-3">Stock Item Name</th>
+                        <th className="p-3">Proposed Stock Group</th>
+                        <th className="p-3">Unit</th>
+                        <th className="p-3">HSN/SAC</th>
+                        <th className="p-3">GST Rate %</th>
+                        <th className="p-3">Source Row / Voucher</th>
+                        <th className="p-3">Action</th>
+                        <th className="p-3">Replace With</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-zinc-100">
+                      {missingStockItems.map(i => (
+                        <tr key={i.id} className="hover:bg-zinc-50/50 transition-colors">
+                          <td className="p-3">
+                            <input
+                              type="text"
+                              value={i.name}
+                              onChange={e => handleUpdateStockItem(i.id, { name: e.target.value })}
+                              className="w-full px-2 py-1 border border-zinc-200 rounded-md focus:border-zinc-900 focus:ring-1 focus:ring-zinc-900 outline-none font-medium text-zinc-800"
+                            />
+                            {i.possibleMatches.length > 0 && (
+                              <div className="text-[10px] text-amber-600 mt-1 pl-1">
+                                Possible Matches: {i.possibleMatches.join(', ')}
+                              </div>
+                            )}
+                          </td>
+                          <td className="p-3">
+                            <input
+                              type="text"
+                              value={i.proposedStockGroup}
+                              placeholder="Suspense Stock Group"
+                              onChange={e => handleUpdateStockItem(i.id, { proposedStockGroup: e.target.value })}
+                              className="w-full px-2 py-1 border border-zinc-200 rounded-md focus:border-zinc-900 focus:ring-1 focus:ring-zinc-900 outline-none text-zinc-700"
+                            />
+                          </td>
+                          <td className="p-3">
+                            <select
+                              value={i.unit}
+                              onChange={e => handleUpdateStockItem(i.id, { unit: e.target.value })}
+                              className="w-full px-2 py-1 border border-zinc-200 rounded-md bg-white focus:border-zinc-900 focus:ring-1 focus:ring-zinc-900 outline-none text-zinc-700"
+                            >
+                              <option value="">-- Select --</option>
+                              {Array.from(new Set([
+                                ...((tallyContext?.units || [])),
+                                'NOS', 'PCS', 'BOX', 'KG', 'MTR', 'BAG'
+                              ])).map(u => (
+                                <option key={u} value={u}>{u}</option>
+                              ))}
+                            </select>
+                          </td>
+                          <td className="p-3">
+                            <input
+                              type="text"
+                              value={i.hsn}
+                              placeholder="e.g. 8471"
+                              onChange={e => handleUpdateStockItem(i.id, { hsn: e.target.value })}
+                              className="w-full px-2 py-1 border border-zinc-200 rounded-md focus:border-zinc-900 focus:ring-1 focus:ring-zinc-900 outline-none text-zinc-700"
+                            />
+                          </td>
+                          <td className="p-3">
+                            <input
+                              type="number"
+                              value={i.gstRate}
+                              onChange={e => handleUpdateStockItem(i.id, { gstRate: parseFloat(e.target.value) || 0 })}
+                              className="w-16 px-2 py-1 border border-zinc-200 rounded-md focus:border-zinc-900 focus:ring-1 focus:ring-zinc-900 outline-none text-zinc-700"
+                            />
+                          </td>
+                          <td className="p-3 text-zinc-500 max-w-[120px] truncate" title={i.sourceRowOrVoucher}>
+                            {i.sourceRowOrVoucher}
+                          </td>
+                          <td className="p-3">
+                            <select
+                              value={i.action}
+                              onChange={e => handleUpdateStockItem(i.id, { action: e.target.value as any })}
+                              className="px-2 py-1 border border-zinc-200 rounded-md bg-white focus:border-zinc-900 focus:ring-1 focus:ring-zinc-900 outline-none font-medium"
+                            >
+                              <option value="Create">Create</option>
+                              <option value="Replace">Replace</option>
+                              <option value="Ignore">Ignore</option>
+                            </select>
+                          </td>
+                          <td className="p-3">
+                            <select
+                              value={i.replacementName}
+                              disabled={i.action !== 'Replace'}
+                              onChange={e => handleUpdateStockItem(i.id, { replacementName: e.target.value })}
+                              className="w-full px-2 py-1 border border-zinc-200 rounded-md bg-white disabled:bg-zinc-50 disabled:text-zinc-400 focus:border-zinc-900 focus:ring-1 focus:ring-zinc-900 outline-none"
+                            >
+                              <option value="">-- Select Master --</option>
+                              {(tallyContext?.stockItems || []).map(m => (
+                                <option key={m} value={m}>{m}</option>
+                              ))}
+                            </select>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* Final Export Controls */}
+            <div className="pt-6 border-t border-zinc-100 flex flex-col md:flex-row md:items-center justify-between gap-4">
+              <div className="text-xs text-zinc-500">
+                Correct master details will be embedded automatically. Standard Tally structure is enforced.
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  type="button"
+                  onClick={downloadReviewedExcel}
+                  className="px-4 py-2.5 border border-zinc-200 hover:bg-zinc-50 text-zinc-700 text-xs font-semibold rounded-xl transition-all"
+                >
+                  Download Reviewed Excel
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const validationErrors = validateReview();
+                    if (validationErrors.length > 0) return;
+                    setIsProcessing(true);
+                    if (pendingExportType === 'Vouchers') {
+                      const finalVouchers = getReviewedVouchers();
+                      await generateFinalXMLFromVerificationDirect(finalVouchers, true);
+                    } else {
+                      const finalInvoices = getReviewedInvoices();
+                      await generateSalesPurchaseXMLFromVerificationDirect(finalInvoices, true);
+                    }
+                  }}
+                  disabled={validateReview().length > 0}
+                  className="px-5 py-2.5 bg-zinc-900 hover:bg-zinc-800 disabled:opacity-40 text-white text-xs font-semibold rounded-xl shadow-sm transition-all flex items-center gap-2"
+                >
+                  <CheckCircle2 className="w-4 h-4" />
+                  Download Combined XML
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const validationErrors = validateReview();
+                    if (validationErrors.length > 0) return;
+                    setIsProcessing(true);
+                    // Download masters
+                    const mastersXml = generateCombinedImportXML({
+                      voucherXml: '',
+                      ...buildMissingMastersXMLs()
+                    });
+                    downloadXML(mastersXml, 'TallyGen_Missing_Masters.xml');
+
+                    // Download vouchers
+                    if (pendingExportType === 'Vouchers') {
+                      const finalVouchers = getReviewedVouchers();
+                      await generateFinalXMLFromVerificationDirect(finalVouchers, false);
+                    } else {
+                      const finalInvoices = getReviewedInvoices();
+                      await generateSalesPurchaseXMLFromVerificationDirect(finalInvoices, false);
+                    }
+                  }}
+                  disabled={validateReview().length > 0}
+                  className="px-4 py-2.5 border border-zinc-300 hover:bg-zinc-100 disabled:opacity-40 text-zinc-800 text-xs font-semibold rounded-xl transition-all"
+                >
+                  Download Separate Files
+                </button>
+              </div>
+            </div>
+          </motion.section>
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
           {/* Left: Main Workflow */}
           <div className="lg:col-span-2 space-y-6">
             <AnimatePresence mode="wait">
@@ -4463,109 +5065,122 @@ export default function App() {
                                 <option value="Receipt">Receipt</option>
                                 <option value="Contra">Contra</option>
                                 <option value="Journal">Journal</option>
+                                <option value="Sales">Sales</option>
+                                <option value="Purchase">Purchase</option>
                               </select>
                             </div>
 
-                            <div className="space-y-2">
-                              <div className="flex items-center justify-between">
-                                <label className="text-sm font-medium text-zinc-700">Bank / Cash Ledger</label>
-                                {tallyContext && (
-                                  <label className="flex items-center gap-1.5 text-xs text-zinc-500 cursor-pointer hover:text-zinc-900 transition-colors select-none">
-                                    <input 
-                                      type="checkbox"
-                                      checked={showAllLedgers}
-                                      onChange={(e) => setShowAllLedgers(e.target.checked)}
-                                      className="rounded border-zinc-300 text-zinc-900 focus:ring-zinc-950 w-3.5 h-3.5"
-                                    />
-                                    <span>Show all ledgers</span>
-                                  </label>
+                            {!['Sales', 'Purchase'].includes(selectedVoucherType) ? (
+                              <div className="space-y-2">
+                                <div className="flex items-center justify-between">
+                                  <label className="text-sm font-medium text-zinc-700">Bank / Cash Ledger</label>
+                                  {tallyContext && (
+                                    <label className="flex items-center gap-1.5 text-xs text-zinc-500 cursor-pointer hover:text-zinc-900 transition-colors select-none">
+                                      <input 
+                                        type="checkbox"
+                                        checked={showAllLedgers}
+                                        onChange={(e) => setShowAllLedgers(e.target.checked)}
+                                        className="rounded border-zinc-300 text-zinc-900 focus:ring-zinc-950 w-3.5 h-3.5"
+                                      />
+                                      <span>Show all ledgers</span>
+                                    </label>
+                                  )}
+                                </div>
+                                <select 
+                                  value={selectedBankLedger}
+                                  onChange={(e) => setSelectedBankLedger(e.target.value)}
+                                  className="w-full p-3 bg-zinc-50 border border-zinc-200 rounded-xl focus:ring-2 focus:ring-zinc-900 outline-none transition-all text-sm"
+                                >
+                                  <option value="">Select Bank / Cash Ledger...</option>
+                                  {(() => {
+                                    if (!tallyContext) return null;
+                                    
+                                    if (showAllLedgers) {
+                                      return tallyContext.ledgers.map(ledger => {
+                                        const groupName = tallyContext.ledgerGroupMap?.[ledger];
+                                        return (
+                                          <option key={ledger} value={ledger}>
+                                            {ledger}{groupName ? ` — ${groupName}` : ''}
+                                          </option>
+                                        );
+                                      });
+                                    }
+
+                                    const strictMatches: string[] = [];
+                                    const possibleMatches: string[] = [];
+
+                                    tallyContext.ledgers.forEach(ledger => {
+                                      if (isStrictBankCashLedger(ledger, tallyContext)) {
+                                        strictMatches.push(ledger);
+                                      } else {
+                                        // Check if it's a potential bank/cash ledger by name when group classification is missing or not strict
+                                        const nameLower = ledger.toLowerCase();
+                                        const hasBankWord = ['bank', 'cash', 'hdfc', 'icici', 'sbi', 'axis', 'kotak', 'yes bank', 'canara', 'pnb', 'union bank', 'bob', 'idfc', 'rbl'].some(kw => nameLower.includes(kw));
+                                        const hasExcludeWord = ['charges', 'interest', 'loan', 'rebate', 'discount', 'gst', 'vehicle', 'fee', 'charge', 'chg', 'tax'].some(kw => nameLower.includes(kw));
+                                        
+                                        if (hasBankWord && !hasExcludeWord) {
+                                          possibleMatches.push(ledger);
+                                        }
+                                      }
+                                    });
+
+                                    return (
+                                      <>
+                                        {strictMatches.length > 0 && (
+                                          <optgroup label="Strict Matches (Recommended)">
+                                            {strictMatches.map(ledger => {
+                                              const groupName = tallyContext.ledgerGroupMap?.[ledger];
+                                              return (
+                                                <option key={ledger} value={ledger}>
+                                                  {ledger}{groupName ? ` — ${groupName}` : ''}
+                                                </option>
+                                              );
+                                            })}
+                                          </optgroup>
+                                        )}
+                                        {possibleMatches.length > 0 && (
+                                          <optgroup label="Possible Matches (Review Carefully)">
+                                            {possibleMatches.map(ledger => {
+                                              const groupName = tallyContext.ledgerGroupMap?.[ledger];
+                                              return (
+                                                <option key={ledger} value={ledger}>
+                                                  {ledger}{groupName ? ` — ${groupName}` : ''}
+                                                </option>
+                                              );
+                                            })}
+                                          </optgroup>
+                                        )}
+                                        {strictMatches.length === 0 && possibleMatches.length === 0 && (
+                                          <option value="" disabled>No bank/cash ledgers found. Try "Show all ledgers".</option>
+                                        )}
+                                      </>
+                                    );
+                                  })()}
+                                </select>
+                                {tallyContext ? (
+                                  <p className="text-[11px] text-zinc-400 mt-1 leading-relaxed">
+                                    {showAllLedgers 
+                                      ? "Showing all ledgers. Please select only actual Bank / Cash ledger for voucher generation."
+                                      : "Default list shows only ledgers classified under Bank Accounts, Cash-in-Hand, Bank OD/CC groups in uploaded Tally Masters. Use 'Show all ledgers' only if your bank ledger is not classified correctly in Tally."
+                                    }
+                                  </p>
+                                ) : (
+                                  <p className="text-xs text-amber-600 flex items-center gap-1 mt-1 leading-relaxed">
+                                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                                    Load Tally Masters first for Bank/Cash ledger list, or continue manually if available.
+                                  </p>
                                 )}
                               </div>
-                              <select 
-                                value={selectedBankLedger}
-                                onChange={(e) => setSelectedBankLedger(e.target.value)}
-                                className="w-full p-3 bg-zinc-50 border border-zinc-200 rounded-xl focus:ring-2 focus:ring-zinc-900 outline-none transition-all text-sm"
-                              >
-                                <option value="">Select Bank / Cash Ledger...</option>
-                                {(() => {
-                                  if (!tallyContext) return null;
-                                  
-                                  if (showAllLedgers) {
-                                    return tallyContext.ledgers.map(ledger => {
-                                      const groupName = tallyContext.ledgerGroupMap?.[ledger];
-                                      return (
-                                        <option key={ledger} value={ledger}>
-                                          {ledger}{groupName ? ` — ${groupName}` : ''}
-                                        </option>
-                                      );
-                                    });
-                                  }
-
-                                  const strictMatches: string[] = [];
-                                  const possibleMatches: string[] = [];
-
-                                  tallyContext.ledgers.forEach(ledger => {
-                                    if (isStrictBankCashLedger(ledger, tallyContext)) {
-                                      strictMatches.push(ledger);
-                                    } else {
-                                      // Check if it's a potential bank/cash ledger by name when group classification is missing or not strict
-                                      const nameLower = ledger.toLowerCase();
-                                      const hasBankWord = ['bank', 'cash', 'hdfc', 'icici', 'sbi', 'axis', 'kotak', 'yes bank', 'canara', 'pnb', 'union bank', 'bob', 'idfc', 'rbl'].some(kw => nameLower.includes(kw));
-                                      const hasExcludeWord = ['charges', 'interest', 'loan', 'rebate', 'discount', 'gst', 'vehicle', 'fee', 'charge', 'chg', 'tax'].some(kw => nameLower.includes(kw));
-                                      
-                                      if (hasBankWord && !hasExcludeWord) {
-                                        possibleMatches.push(ledger);
-                                      }
-                                    }
-                                  });
-
-                                  return (
-                                    <>
-                                      {strictMatches.length > 0 && (
-                                        <optgroup label="Strict Matches (Recommended)">
-                                          {strictMatches.map(ledger => {
-                                            const groupName = tallyContext.ledgerGroupMap?.[ledger];
-                                            return (
-                                              <option key={ledger} value={ledger}>
-                                                {ledger}{groupName ? ` — ${groupName}` : ''}
-                                              </option>
-                                            );
-                                          })}
-                                        </optgroup>
-                                      )}
-                                      {possibleMatches.length > 0 && (
-                                        <optgroup label="Possible Matches (Review Carefully)">
-                                          {possibleMatches.map(ledger => {
-                                            const groupName = tallyContext.ledgerGroupMap?.[ledger];
-                                            return (
-                                              <option key={ledger} value={ledger}>
-                                                {ledger}{groupName ? ` — ${groupName}` : ''}
-                                              </option>
-                                            );
-                                          })}
-                                        </optgroup>
-                                      )}
-                                      {strictMatches.length === 0 && possibleMatches.length === 0 && (
-                                        <option value="" disabled>No bank/cash ledgers found. Try "Show all ledgers".</option>
-                                      )}
-                                    </>
-                                  );
-                                })()}
-                              </select>
-                              {tallyContext ? (
-                                <p className="text-[11px] text-zinc-400 mt-1 leading-relaxed">
-                                  {showAllLedgers 
-                                    ? "Showing all ledgers. Please select only actual Bank / Cash ledger for voucher generation."
-                                    : "Default list shows only ledgers classified under Bank Accounts, Cash-in-Hand, Bank OD/CC groups in uploaded Tally Masters. Use 'Show all ledgers' only if your bank ledger is not classified correctly in Tally."
-                                  }
-                                </p>
-                              ) : (
-                                <p className="text-xs text-amber-600 flex items-center gap-1 mt-1 leading-relaxed">
-                                  <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                                  Load Tally Masters first for Bank/Cash ledger list, or continue manually if available.
-                                </p>
-                              )}
-                            </div>
+                            ) : (
+                              <div className="space-y-2">
+                                <label className="text-sm font-medium text-zinc-700">Sales/Purchase Ledgers</label>
+                                <div className="p-4 bg-zinc-50 border border-zinc-200 rounded-xl">
+                                  <p className="text-xs text-zinc-600 leading-relaxed font-medium">
+                                    Party Ledgers and Sales/Purchase Accounts are parsed directly from your Excel spreadsheet. No Bank/Cash ledger selection is needed.
+                                  </p>
+                                </div>
+                              </div>
+                            )}
                           </div>
 
                           {/* Two clear import method cards */}
@@ -4631,7 +5246,7 @@ export default function App() {
                                 className="p-4 bg-zinc-50 rounded-xl border border-zinc-200/60 mt-3 flex flex-wrap gap-2 items-center"
                               >
                                 <span className="text-xs font-bold text-zinc-600 block mr-2">Download Template:</span>
-                                {['Payment', 'Receipt', 'Contra', 'Journal', 'Sales', 'Purchase'].map(type => (
+                                {['Payment', 'Receipt', 'Contra', 'Journal', 'Sales Itemwise', 'Sales Voucherwise', 'Purchase Itemwise', 'Purchase Voucherwise'].map(type => (
                                   <button
                                     key={type}
                                     type="button"
@@ -4725,20 +5340,20 @@ export default function App() {
                       )}
                       
                       <div className={`border-2 border-dashed rounded-xl p-12 text-center transition-colors relative group ${
-                        importType === 'Voucher' && !selectedBankLedger 
+                        importType === 'Voucher' && !['Sales', 'Purchase'].includes(selectedVoucherType) && !selectedBankLedger 
                           ? 'border-zinc-100 bg-zinc-50/50 cursor-not-allowed' 
                           : 'border-zinc-200 hover:border-zinc-400 cursor-pointer'
                       }`}>
                         <input 
-                          type="file" 
-                          accept=".xlsx, .xls, .csv, .pdf" 
-                          onChange={handleFileUpload}
-                          className="absolute inset-0 opacity-0 cursor-pointer disabled:cursor-not-allowed"
-                          disabled={isProcessing || (importType === 'Voucher' && !selectedBankLedger)}
+                           type="file" 
+                           accept=".xlsx, .xls, .csv, .pdf" 
+                           onChange={handleFileUpload}
+                           className="absolute inset-0 opacity-0 cursor-pointer disabled:cursor-not-allowed"
+                           disabled={isProcessing || (importType === 'Voucher' && !['Sales', 'Purchase'].includes(selectedVoucherType) && !selectedBankLedger)}
                         />
                         <div className="space-y-4">
                           <div className={`w-12 h-12 rounded-full flex items-center justify-center mx-auto transition-colors ${
-                            importType === 'Voucher' && !selectedBankLedger 
+                            importType === 'Voucher' && !['Sales', 'Purchase'].includes(selectedVoucherType) && !selectedBankLedger 
                               ? 'bg-zinc-100 text-zinc-300' 
                               : 'bg-zinc-100 text-zinc-600 group-hover:bg-zinc-200'
                           }`}>
@@ -7468,6 +8083,24 @@ export default function App() {
                     </button>
                   ))}
                 </div>
+                <p className="text-sm text-zinc-500 mb-2 font-medium">Sales & Purchase Templates:</p>
+                <div className="grid grid-cols-2 gap-2 mb-4">
+                  {[
+                    { key: 'Sales Itemwise', label: 'Sales (Itemwise)' },
+                    { key: 'Sales Voucherwise', label: 'Sales (Voucherwise)' },
+                    { key: 'Purchase Itemwise', label: 'Purchase (Itemwise)' },
+                    { key: 'Purchase Voucherwise', label: 'Purchase (Voucherwise)' }
+                  ].map(item => (
+                    <button 
+                      key={item.key}
+                      onClick={() => downloadTemplate(item.key)}
+                      className="flex items-center justify-center gap-2 p-2 bg-zinc-50 hover:bg-zinc-100 border border-zinc-200 rounded-lg text-[10px] font-medium transition-colors"
+                    >
+                      <Download className="w-3 h-3 text-zinc-500" />
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
                 <p className="text-sm text-zinc-500 mb-2 font-medium">Master Templates:</p>
                 <div className="grid grid-cols-2 gap-2">
                   {[
@@ -7632,6 +8265,7 @@ export default function App() {
             </section>
           </div>
         </div>
+        )}
       </main>
 
       {/* Restart / Reset Confirmation Modal */}

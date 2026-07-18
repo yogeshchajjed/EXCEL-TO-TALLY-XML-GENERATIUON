@@ -1,0 +1,91 @@
+import { ProfileDefinition } from './salesPurchaseSchema';
+
+export const TEMPLATE_PROFILES: ProfileDefinition[] = [
+  {
+    id: 'standard_itemwise',
+    name: 'Standard Itemwise Template',
+    description: 'One row per stock item line. Perfect for detailed product-level sales & purchases with multiple lines per invoice.',
+    type: 'itemwise',
+    columns: [
+      'Voucher Type', 'Invoice Date', 'Invoice No', 'Party Ledger', 'Sales/Purchase Ledger',
+      'Stock Item', 'Description', 'Quantity', 'Unit', 'Rate', 'Item Amount', 'GST Mode',
+      'GST Rate %', 'HSN/SAC', 'CGST Ledger', 'CGST Amount', 'SGST Ledger', 'SGST Amount',
+      'IGST Ledger', 'IGST Amount', 'Freight Ledger', 'Freight Amount', 'Packing Ledger', 'Packing Amount',
+      'Loading/Unloading Ledger', 'Loading/Unloading Amount', 'Insurance Ledger', 'Insurance Amount',
+      'Other Charges Ledger 1', 'Other Charges Amount 1', 'Other Charges Ledger 2', 'Other Charges Amount 2',
+      'Discount Ledger', 'Bill Discount Amount', 'Round Off Ledger', 'Round Off Amount',
+      'Party GSTIN', 'Party Address 1', 'Party Address 2', 'Party State', 'Place of Supply', 'Party Registration Type',
+      'Dispatch Date', 'Delivery Note No', 'Dispatch Doc No', 'Bilty/LR No', 'Transporter Name', 'Transporter GSTIN',
+      'Vehicle No', 'Destination', 'Mode of Transport', 'E-way Bill No', 'Narration', 'Reference'
+    ]
+  },
+  {
+    id: 'standard_voucherwise',
+    name: 'Standard Voucherwise Template',
+    description: 'One row per complete voucher. Supports optional inventory. If inventory is blank, compiles into an Accounting Voucher; if filled, compiles into an Item Invoice.',
+    type: 'voucherwise',
+    columns: [
+      'Invoice Date',
+      'Invoice No',
+      'Voucher Type',
+      'Party Ledger',
+      'Party GSTIN',
+      'Place of Supply',
+      'Sales/Purchase Ledger',
+      'Taxable Value (Purchase Value)',
+      'GST Mode',
+      'GST Rate %',
+      'CGST Ledger',
+      'CGST Amount',
+      'SGST Ledger',
+      'SGST Amount',
+      'IGST Ledger',
+      'IGST Amount',
+      'Other Ledger 1',
+      'Other Amount 1',
+      'Round Off Ledger',
+      'Round Off Amount',
+      'Stock Item',
+      'Description',
+      'Quantity',
+      'Unit',
+      'Rate',
+      'Item Amount',
+      'Discount %',
+      'HSN/SAC',
+      'Party Address 1',
+      'Party Address 2',
+      'Party State',
+      'Dispatch Date',
+      'Delivery Note No',
+      'Dispatch Doc No',
+      'Bilty LR No',
+      'Transporter Name',
+      'Transporter GSTIN',
+      'Vehicle No',
+      'Destination',
+      'Mode of Transport',
+      'Eway Bill No',
+      'Freight Ledger',
+      'Freight Amount',
+      'Packing Ledger',
+      'Packing Amount',
+      'Loading Ledger',
+      'Loading Amount',
+      'Insurance Ledger',
+      'Insurance Amount',
+      'Other Ledger 2',
+      'Other Amount 2',
+      'Discount Ledger',
+      'Bill Discount Amount',
+      'Narration',
+      'Reference',
+      'Voucher Mode',
+      'Inventory Mode'
+    ]
+  }
+];
+
+export function getProfileById(id: string): ProfileDefinition | undefined {
+  return TEMPLATE_PROFILES.find(p => p.id === id);
+}
