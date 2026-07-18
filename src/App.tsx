@@ -51,7 +51,8 @@ import {
   RotateCcw,
   Upload,
   HelpCircle,
-  Building
+  Building,
+  Trash2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import * as XLSX from 'xlsx';
@@ -275,6 +276,33 @@ const isStrictBankCashLedger = (ledgerName: string, context: TallyContext | null
   return false;
 };
 
+export interface JournalLine {
+  rowNo: number;
+  ledgerName: string;
+  drCr: 'Dr' | 'Cr';
+  amount: number;
+  narration?: string;
+  reference?: string;
+  costCentre?: string;
+  billReference?: string;
+  remarks?: string;
+  excluded?: boolean;
+  validationMessage?: string;
+}
+
+export interface JournalVoucherGroup {
+  voucherNo: string;
+  voucherDate: string;
+  totalDebit: number;
+  totalCredit: number;
+  difference: number;
+  status: 'Balanced' | 'Error';
+  lines: JournalLine[];
+  errors: string[];
+  warnings: string[];
+  isValid: boolean;
+}
+
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
@@ -319,6 +347,120 @@ export default function App() {
     if (anyMatch) return anyMatch;
 
     return `${gstType} ${isSales ? 'Output' : 'Input'} ${rateHalf}%`;
+  };
+
+  interface SalesPurchaseBalancingResult {
+    invoiceNo: string;
+    debitTotal: number;
+    creditTotal: number;
+    expectedPartyAmount: number;
+    actualPartyAmount: number;
+    difference: number;
+    isBalanced: boolean;
+    ledgerEntries: { ledgerName: string; amount: number; isParty: boolean }[];
+  }
+
+  const verifySalesPurchaseBalancing = (inv: SalesPurchaseInvoice): SalesPurchaseBalancingResult => {
+    const isSales = inv.voucherType === 'Sales';
+    const ledgerEntries: { ledgerName: string; amount: number; isParty: boolean }[] = [];
+
+    // 1. Party ledger (Actual Party Amount)
+    const actualPartyAmount = isSales ? -inv.invoiceTotal : inv.invoiceTotal;
+    ledgerEntries.push({
+      ledgerName: inv.partyLedger || 'Missing Party Ledger',
+      amount: actualPartyAmount,
+      isParty: true
+    });
+
+    // 2. Sales/Purchase Ledger
+    const totalTaxable = inv.items.reduce((sum, item) => sum + item.taxableValue, 0);
+    const salesPurchaseAmount = isSales ? totalTaxable : -totalTaxable;
+    ledgerEntries.push({
+      ledgerName: inv.salesPurchaseLedger || (isSales ? 'Sales Account' : 'Purchase Account'),
+      amount: salesPurchaseAmount,
+      isParty: false
+    });
+
+    // 3. GST Ledgers
+    const gstSums: Record<string, number> = {};
+    inv.items.forEach(item => {
+      if (item.cgstLedger && item.cgstAmount) {
+        gstSums[item.cgstLedger] = (gstSums[item.cgstLedger] || 0) + item.cgstAmount;
+      }
+      if (item.sgstLedger && item.sgstAmount) {
+        gstSums[item.sgstLedger] = (gstSums[item.sgstLedger] || 0) + item.sgstAmount;
+      }
+      if (item.igstLedger && item.igstAmount) {
+        gstSums[item.igstLedger] = (gstSums[item.igstLedger] || 0) + item.igstAmount;
+      }
+    });
+    Object.entries(gstSums).forEach(([ledgerName, amount]) => {
+      ledgerEntries.push({
+        ledgerName,
+        amount: isSales ? amount : -amount,
+        isParty: false
+      });
+    });
+
+    // 4. Additional Charges
+    const charges = [
+      { ledger: inv.freightLedger, amount: inv.freightAmount, isDiscount: false },
+      { ledger: inv.packingLedger, amount: inv.packingAmount, isDiscount: false },
+      { ledger: inv.loadingLedger, amount: inv.loadingAmount, isDiscount: false },
+      { ledger: inv.insuranceLedger, amount: inv.insuranceAmount, isDiscount: false },
+      { ledger: inv.otherLedger1, amount: inv.otherAmount1, isDiscount: false },
+      { ledger: inv.otherLedger2, amount: inv.otherAmount2, isDiscount: false },
+      { ledger: inv.discountLedger, amount: inv.billDiscountAmount, isDiscount: true },
+      { ledger: inv.roundOffLedger, amount: inv.roundOffAmount, isDiscount: false }
+    ];
+
+    charges.forEach(c => {
+      if (c.ledger && c.amount !== undefined && c.amount !== 0) {
+        let signValue = c.amount;
+        if (c.isDiscount) {
+          signValue = -c.amount;
+        }
+        const chargeAmountSign = isSales ? signValue : -signValue;
+        ledgerEntries.push({
+          ledgerName: c.ledger,
+          amount: chargeAmountSign,
+          isParty: false
+        });
+      }
+    });
+
+    // Calculate totals and difference
+    let debitTotal = 0;
+    let creditTotal = 0;
+    let othersSum = 0;
+
+    ledgerEntries.forEach(entry => {
+      if (entry.amount < 0) {
+        debitTotal += Math.abs(entry.amount);
+      } else {
+        creditTotal += entry.amount;
+      }
+
+      if (!entry.isParty) {
+        othersSum += entry.amount;
+      }
+    });
+
+    const expectedPartyAmount = -othersSum;
+    const difference = actualPartyAmount - expectedPartyAmount;
+    // Round to 2 decimal places to avoid float precision comparison issues
+    const isBalanced = Math.abs(Math.round(difference * 100) / 100) < 0.01;
+
+    return {
+      invoiceNo: inv.invoiceNo,
+      debitTotal: Math.round(debitTotal * 100) / 100,
+      creditTotal: Math.round(creditTotal * 100) / 100,
+      expectedPartyAmount: Math.round(expectedPartyAmount * 100) / 100,
+      actualPartyAmount: Math.round(actualPartyAmount * 100) / 100,
+      difference: Math.round(difference * 100) / 100,
+      isBalanced,
+      ledgerEntries
+    };
   };
 
   const processSalesPurchaseExcel = (jsonData: any[]): SalesPurchaseInvoice[] => {
@@ -508,7 +650,12 @@ export default function App() {
   const [missingLedgers, setMissingLedgers] = useState<MissingLedgerItem[]>([]);
   const [missingStockItems, setMissingStockItems] = useState<MissingStockItem[]>([]);
   const [showMissingMastersReview, setShowMissingMastersReview] = useState(false);
-  const [pendingExportType, setPendingExportType] = useState<'Vouchers' | 'SalesPurchase' | null>(null);
+  const [pendingExportType, setPendingExportType] = useState<'Vouchers' | 'SalesPurchase' | 'Journal' | null>(null);
+  const [salesPurchaseBalancingErrors, setSalesPurchaseBalancingErrors] = useState<SalesPurchaseBalancingResult[]>([]);
+
+  // Journal Voucher States
+  const [journalGroups, setJournalGroups] = useState<JournalVoucherGroup[]>([]);
+  const [selectedJournalGroupIdx, setSelectedJournalGroupIdx] = useState(0);
 
   const handleUpdateLedger = (id: string, updates: Partial<MissingLedgerItem>) => {
     setMissingLedgers(prev => prev.map(l => l.id === id ? { ...l, ...updates } : l));
@@ -516,6 +663,530 @@ export default function App() {
 
   const handleUpdateStockItem = (id: string, updates: Partial<MissingStockItem>) => {
     setMissingStockItems(prev => prev.map(i => i.id === id ? { ...i, ...updates } : i));
+  };
+
+  // --- Journal Voucher Helpers ---
+  const parseJournalExcel = (jsonData: any[]): JournalVoucherGroup[] => {
+    const getValueByHeader = (row: any, header?: string) => {
+      if (!header) return null;
+      if (row[header] !== undefined) return row[header];
+      const key = Object.keys(row).find(k => k.toLowerCase().trim() === header.toLowerCase().trim());
+      return key ? row[key] : null;
+    };
+
+    const rawLines: JournalLine[] = jsonData.map((row: any, index: number) => {
+      const rowNo = index + 2;
+      const rawDate = getValueByHeader(row, 'Voucher Date');
+      const rawVNo = getValueByHeader(row, 'Voucher No');
+      const rawLedger = getValueByHeader(row, 'Ledger Name');
+      const rawDrCr = getValueByHeader(row, 'Dr/Cr');
+      const rawAmount = getValueByHeader(row, 'Amount');
+      const rawNarration = getValueByHeader(row, 'Narration');
+      const rawRef = getValueByHeader(row, 'Reference');
+      const rawCostCentre = getValueByHeader(row, 'Cost Centre');
+      const rawBillRef = getValueByHeader(row, 'Bill Reference');
+      const rawRemarks = getValueByHeader(row, 'Remarks');
+
+      const parsedAmt = parseFloat(String(rawAmount || '0').replace(/,/g, ''));
+      let drCrClean: 'Dr' | 'Cr' = 'Dr';
+      if (rawDrCr) {
+        const dStr = String(rawDrCr).trim().toLowerCase();
+        if (dStr === 'cr' || dStr === 'credit' || dStr === 'c') {
+          drCrClean = 'Cr';
+        }
+      }
+
+      return {
+        rowNo,
+        ledgerName: rawLedger ? String(rawLedger).trim() : '',
+        drCr: drCrClean,
+        amount: isNaN(parsedAmt) ? 0 : parsedAmt,
+        narration: rawNarration ? String(rawNarration).trim() : '',
+        reference: rawRef ? String(rawRef).trim() : '',
+        costCentre: rawCostCentre ? String(rawCostCentre).trim() : '',
+        billReference: rawBillRef ? String(rawBillRef).trim() : '',
+        remarks: rawRemarks ? String(rawRemarks).trim() : '',
+        excluded: false,
+        voucherNo: rawVNo ? String(rawVNo).trim() : '',
+        voucherDate: rawDate
+      } as any;
+    });
+
+    const groupsMap: Record<string, JournalLine[]> = {};
+    rawLines.forEach((line: any) => {
+      const vNo = line.voucherNo || 'BLANK_VOUCHER';
+      if (!groupsMap[vNo]) {
+        groupsMap[vNo] = [];
+      }
+      groupsMap[vNo].push(line);
+    });
+
+    const groups: JournalVoucherGroup[] = Object.keys(groupsMap).map(vNo => {
+      const lines = groupsMap[vNo];
+      const errors: string[] = [];
+      const warnings: string[] = [];
+
+      const dates = lines.map((l: any) => l.voucherDate).filter(Boolean);
+      const uniqueDates = Array.from(new Set(dates.map(d => {
+        const norm = normalizeTallyDate(d);
+        return norm.isValid ? norm.value : String(d);
+      })));
+
+      let normalizedDate = '';
+      if (dates.length > 0) {
+        const primaryDateNorm = normalizeTallyDate(dates[0]);
+        if (primaryDateNorm.isValid) {
+          normalizedDate = primaryDateNorm.value;
+        } else {
+          errors.push(`Invalid Voucher Date value "${dates[0]}". Error: ${primaryDateNorm.error}`);
+        }
+      } else {
+        errors.push("Voucher Date is missing.");
+      }
+
+      if (uniqueDates.length > 1) {
+        errors.push(`Same Voucher No "${vNo}" has multiple different dates: ${uniqueDates.join(', ')}.`);
+      }
+
+      lines.forEach(l => {
+        if (!l.ledgerName) {
+          errors.push(`Row ${l.rowNo}: Ledger Name cannot be blank.`);
+          l.validationMessage = "Ledger Name cannot be blank.";
+        }
+        if (l.amount <= 0) {
+          errors.push(`Row ${l.rowNo}: Amount must be a positive numeric value.`);
+          l.validationMessage = "Amount must be a positive numeric value.";
+        }
+      });
+
+      const debits = lines.filter(l => !l.excluded && l.drCr === 'Dr');
+      const credits = lines.filter(l => !l.excluded && l.drCr === 'Cr');
+
+      const totalDebit = debits.reduce((sum, l) => sum + l.amount, 0);
+      const totalCredit = credits.reduce((sum, l) => sum + l.amount, 0);
+      const difference = totalDebit - totalCredit;
+
+      const activeLines = lines.filter(l => !l.excluded);
+      if (activeLines.length < 2) {
+        errors.push(`Voucher "${vNo}" requires minimum 2 ledger lines.`);
+      }
+      if (debits.length === 0) {
+        errors.push(`Voucher "${vNo}" has no Debit (Dr) line.`);
+      }
+      if (credits.length === 0) {
+        errors.push(`Voucher "${vNo}" has no Credit (Cr) line.`);
+      }
+      if (Math.abs(difference) > 0.001) {
+        errors.push(`Debit total (${totalDebit.toFixed(2)}) and Credit total (${totalCredit.toFixed(2)}) do not match. Difference: ${difference.toFixed(2)}.`);
+      }
+
+      if (tallyContext) {
+        lines.forEach(l => {
+          if (l.ledgerName) {
+            const exists = tallyContext.ledgers.some(m => m.toLowerCase() === l.ledgerName.toLowerCase());
+            if (!exists) {
+              warnings.push(`Row ${l.rowNo}: Ledger "${l.ledgerName}" not found in Tally masters.`);
+            }
+          }
+        });
+      }
+
+      return {
+        voucherNo: vNo === 'BLANK_VOUCHER' ? '' : vNo,
+        voucherDate: normalizedDate,
+        totalDebit,
+        totalCredit,
+        difference,
+        status: Math.abs(difference) <= 0.001 && debits.length > 0 && credits.length > 0 ? 'Balanced' : 'Error',
+        lines,
+        errors,
+        warnings,
+        isValid: errors.length === 0
+      };
+    });
+
+    return groups;
+  };
+
+  const generateJournalErrorExcel = (groups: JournalVoucherGroup[]) => {
+    const errorGroups = groups.filter(g => !g.isValid);
+    if (errorGroups.length === 0) return;
+
+    const wb = new ExcelJS.Workbook();
+    const sheet = wb.addWorksheet('Errors');
+
+    const headers = [
+      'Voucher No',
+      'Voucher Date',
+      'Debit Total',
+      'Credit Total',
+      'Difference',
+      'Error Type',
+      'Error Message',
+      'Affected Rows'
+    ];
+
+    sheet.getRow(1).values = headers;
+
+    errorGroups.forEach(g => {
+      const rows = g.lines.map(l => l.rowNo);
+      const affectedRows = rows.length > 0 ? `Rows ${Math.min(...rows)}-${Math.max(...rows)}` : '';
+
+      let errorType = 'Validation Error';
+      const errMsg = g.errors.join(' | ');
+      if (errMsg.includes('do not match') || errMsg.includes('Difference')) {
+        errorType = 'Debit/Credit Mismatch';
+      } else if (errMsg.includes('no Debit')) {
+        errorType = 'Missing Debit';
+      } else if (errMsg.includes('no Credit')) {
+        errorType = 'Missing Credit';
+      } else if (errMsg.includes('minimum 2')) {
+        errorType = 'Insufficient Lines';
+      } else if (errMsg.includes('Date')) {
+        errorType = 'Invalid Date';
+      } else if (errMsg.includes('Ledger Name')) {
+        errorType = 'Missing Ledger Name';
+      }
+
+      sheet.addRow([
+        g.voucherNo || 'Blank',
+        g.voucherDate || 'Blank',
+        g.totalDebit,
+        g.totalCredit,
+        g.difference,
+        errorType,
+        errMsg,
+        affectedRows
+      ]);
+    });
+
+    sheet.columns.forEach(col => {
+      let maxLen = 0;
+      col.eachCell({ includeEmpty: true }, (cell) => {
+        const valStr = cell.value ? String(cell.value) : '';
+        if (valStr.length > maxLen) maxLen = valStr.length;
+      });
+      col.width = Math.max(maxLen + 3, 12);
+    });
+
+    wb.xlsx.writeBuffer().then(buffer => {
+      const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Journal_Voucher_Errors.xlsx`;
+      a.click();
+      window.URL.revokeObjectURL(url);
+    });
+  };
+
+  const generateSalesPurchaseBalancingErrorExcel = (errors: SalesPurchaseBalancingResult[]) => {
+    if (errors.length === 0) return;
+
+    const wb = new ExcelJS.Workbook();
+    const sheet = wb.addWorksheet('Balancing_Errors');
+
+    const headers = [
+      'Invoice No',
+      'Debit Total',
+      'Credit Total',
+      'Expected Party Amount',
+      'Actual Party Amount',
+      'Difference'
+    ];
+
+    sheet.getRow(1).values = headers;
+    sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFF' } };
+    sheet.getRow(1).fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'DC2626' } // Red background for errors
+    };
+
+    errors.forEach(err => {
+      sheet.addRow([
+        err.invoiceNo || 'Blank',
+        err.debitTotal,
+        err.creditTotal,
+        err.expectedPartyAmount,
+        err.actualPartyAmount,
+        err.difference
+      ]);
+    });
+
+    sheet.columns.forEach(col => {
+      let maxLen = 0;
+      col.eachCell({ includeEmpty: true }, (cell) => {
+        const valStr = cell.value ? String(cell.value) : '';
+        if (valStr.length > maxLen) maxLen = valStr.length;
+      });
+      col.width = Math.max(maxLen + 3, 15);
+    });
+
+    wb.xlsx.writeBuffer().then(buffer => {
+      const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Sales_Purchase_Balancing_Errors.xlsx`;
+      a.click();
+      window.URL.revokeObjectURL(url);
+    });
+  };
+
+  const generateJournalXML = (groupsToUse: JournalVoucherGroup[], includeMasters: boolean = false) => {
+    const vouchers: TallyVoucher[] = groupsToUse.map(g => {
+      const ledgerEntries = g.lines.filter(l => !l.excluded).map(l => {
+        const amt = l.drCr === 'Dr' ? -l.amount : l.amount;
+        return {
+          ledgerName: l.ledgerName,
+          isDeemedPositive: (l.drCr === 'Dr' ? 'Yes' : 'No') as 'Yes' | 'No',
+          isLastDeemedPositive: (l.drCr === 'Dr' ? 'Yes' : 'No') as 'Yes' | 'No',
+          isPartyLedger: 'No' as 'Yes' | 'No',
+          amount: amt
+        };
+      });
+
+      return {
+        date: g.voucherDate,
+        voucherType: 'Journal',
+        partyName: '',
+        bankLedger: '',
+        voucherNumber: g.voucherNo,
+        narration: g.lines[0]?.narration || undefined,
+        reference: g.lines[0]?.reference || undefined,
+        ledgerEntries
+      };
+    });
+
+    let xml = generateTallyXML(vouchers);
+    if (includeMasters) {
+      xml = generateCombinedImportXML({
+        voucherXml: xml,
+        ...buildMissingMastersXMLs()
+      });
+    }
+    return xml;
+  };
+
+  const checkMissingMastersAndProceedJournal = (groups: JournalVoucherGroup[]) => {
+    setError(null);
+    const ledgersList = tallyContext?.ledgers || [];
+    const usedLedgers: { name: string; source: string; type: string }[] = [];
+
+    groups.forEach(g => {
+      const sourceId = g.voucherNo ? `Journal No: ${g.voucherNo}` : `Journal Voucher`;
+      g.lines.forEach(l => {
+        if (!l.excluded && l.ledgerName) {
+          usedLedgers.push({ name: l.ledgerName, source: sourceId, type: 'Journal Ledger' });
+        }
+      });
+    });
+
+    const detectedLedgers = detectMissingLedgers(usedLedgers, ledgersList);
+
+    if (detectedLedgers.length > 0) {
+      setMissingLedgers(detectedLedgers);
+      setMissingStockItems([]);
+      setPendingExportType('Journal');
+      setShowMissingMastersReview(true);
+      setIsProcessing(false);
+    } else {
+      generateFinalJournalXMLDirect(groups);
+    }
+  };
+
+  const generateFinalJournalXMLDirect = async (groupsToUse: JournalVoucherGroup[], includeMasters: boolean = false) => {
+    if (!user || groupsToUse.length === 0) return;
+    setIsProcessing(true);
+    setError(null);
+
+    try {
+      const conversionPayload: any = {
+        fileName: pendingFileName,
+        status: 'processing',
+        voucherType: 'Journal'
+      };
+      if (getAppMode() === 'web') {
+        conversionPayload.timestamp = serverTimestamp();
+      }
+      const conversionId = await saveConversion(user.uid, conversionPayload);
+
+      const nameMap: Record<string, string> = {};
+      missingLedgers.forEach(ml => {
+        const key = ml.name.toLowerCase();
+        if (ml.action === 'Replace' && ml.replacementName) {
+          nameMap[key] = ml.replacementName;
+        } else if (ml.action === 'Create' && ml.name) {
+          nameMap[key] = ml.name;
+        }
+      });
+
+      const updatedGroups = groupsToUse.map(g => {
+        const updatedLines = g.lines.map(l => {
+          const lKey = l.ledgerName.toLowerCase();
+          if (nameMap[lKey]) {
+            return { ...l, ledgerName: nameMap[lKey] };
+          }
+          return l;
+        });
+        return { ...g, lines: updatedLines };
+      });
+
+      const xml = generateJournalXML(updatedGroups, includeMasters);
+
+      await updateConversion(user.uid, conversionId, {
+        status: 'completed',
+        xmlContent: xml
+      });
+
+      const newRecord: ConversionRecord = {
+        id: conversionId,
+        fileName: pendingFileName,
+        timestamp: { seconds: Math.floor(Date.now() / 1000) },
+        status: 'completed',
+        xmlContent: xml,
+        voucherType: 'Journal'
+      };
+
+      setConversions(prev => [newRecord, ...prev]);
+      setCurrentStep('complete');
+      setIsProcessing(false);
+      setShowMissingMastersReview(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Conversion failed");
+      setIsProcessing(false);
+    }
+  };
+
+  const updateJournalLine = (groupIndex: number, lineIndex: number, updates: Partial<JournalLine>) => {
+    setJournalGroups(prev => {
+      const copy = [...prev];
+      const grp = { ...copy[groupIndex] };
+      const lines = [...grp.lines];
+      lines[lineIndex] = { ...lines[lineIndex], ...updates };
+
+      const errors: string[] = [];
+      const warnings: string[] = [];
+
+      const dates = lines.map((l: any) => l.voucherDate).filter(Boolean);
+      const uniqueDates = Array.from(new Set(dates.map(d => {
+        const norm = normalizeTallyDate(d);
+        return norm.isValid ? norm.value : String(d);
+      })));
+
+      let normalizedDate = grp.voucherDate;
+      if (dates.length > 0) {
+        const primaryDateNorm = normalizeTallyDate(dates[0]);
+        if (primaryDateNorm.isValid) {
+          normalizedDate = primaryDateNorm.value;
+        } else {
+          errors.push(`Invalid Voucher Date value "${dates[0]}". Error: ${primaryDateNorm.error}`);
+        }
+      }
+
+      if (uniqueDates.length > 1) {
+        errors.push(`Same Voucher No "${grp.voucherNo}" has multiple different dates.`);
+      }
+
+      lines.forEach((l, idx) => {
+        l.validationMessage = undefined;
+        if (!l.excluded) {
+          if (!l.ledgerName) {
+            errors.push(`Row ${l.rowNo || idx + 1}: Ledger Name cannot be blank.`);
+            l.validationMessage = "Ledger Name cannot be blank.";
+          }
+          if (l.amount <= 0) {
+            errors.push(`Row ${l.rowNo || idx + 1}: Amount must be a positive numeric value.`);
+            l.validationMessage = "Amount must be a positive numeric value.";
+          }
+        }
+      });
+
+      const debits = lines.filter(l => !l.excluded && l.drCr === 'Dr');
+      const credits = lines.filter(l => !l.excluded && l.drCr === 'Cr');
+
+      const totalDebit = debits.reduce((sum, l) => sum + l.amount, 0);
+      const totalCredit = credits.reduce((sum, l) => sum + l.amount, 0);
+      const difference = totalDebit - totalCredit;
+
+      const activeLines = lines.filter(l => !l.excluded);
+      if (activeLines.length < 2) {
+        errors.push("Requires minimum 2 ledger lines.");
+      }
+      if (debits.length === 0) {
+        errors.push("Has no Debit (Dr) line.");
+      }
+      if (credits.length === 0) {
+        errors.push("Has no Credit (Cr) line.");
+      }
+      if (Math.abs(difference) > 0.001) {
+        errors.push(`Debit total (${totalDebit.toFixed(2)}) and Credit total (${totalCredit.toFixed(2)}) do not match. Diff: ${difference.toFixed(2)}.`);
+      }
+
+      if (tallyContext) {
+        lines.forEach((l, idx) => {
+          if (!l.excluded && l.ledgerName) {
+            const exists = tallyContext.ledgers.some(m => m.toLowerCase() === l.ledgerName.toLowerCase());
+            if (!exists) {
+              warnings.push(`Row ${l.rowNo || idx + 1}: Ledger "${l.ledgerName}" not found in Tally masters.`);
+            }
+          }
+        });
+      }
+
+      grp.lines = lines;
+      grp.totalDebit = totalDebit;
+      grp.totalCredit = totalCredit;
+      grp.difference = difference;
+      grp.errors = errors;
+      grp.warnings = warnings;
+      grp.status = Math.abs(difference) <= 0.001 && debits.length > 0 && credits.length > 0 ? 'Balanced' : 'Error';
+      grp.isValid = errors.length === 0;
+
+      copy[groupIndex] = grp;
+      return copy;
+    });
+  };
+
+  const updateJournalGroupHeader = (groupIndex: number, fields: { voucherNo?: string; voucherDate?: string }) => {
+    setJournalGroups(prev => {
+      const copy = [...prev];
+      const grp = { ...copy[groupIndex] };
+      if (fields.voucherNo !== undefined) grp.voucherNo = fields.voucherNo;
+      if (fields.voucherDate !== undefined) {
+        const norm = normalizeTallyDate(fields.voucherDate);
+        grp.voucherDate = norm.isValid ? norm.value : fields.voucherDate;
+      }
+      copy[groupIndex] = grp;
+      return copy;
+    });
+  };
+
+  const addJournalLine = (groupIndex: number) => {
+    setJournalGroups(prev => {
+      const copy = [...prev];
+      const grp = { ...copy[groupIndex] };
+      const lines = [...grp.lines];
+      lines.push({
+        rowNo: lines.length > 0 ? Math.max(...lines.map(l => l.rowNo)) + 1 : 1,
+        ledgerName: '',
+        drCr: 'Dr',
+        amount: 0,
+        narration: '',
+        reference: '',
+        costCentre: '',
+        billReference: '',
+        remarks: '',
+        excluded: false
+      });
+      grp.lines = lines;
+      copy[groupIndex] = grp;
+      return copy;
+    });
+    setTimeout(() => {
+      updateJournalLine(groupIndex, journalGroups[groupIndex]?.lines.length || 0, {});
+    }, 10);
   };
 
   // Bank Statement Import States
@@ -1253,6 +1924,99 @@ export default function App() {
       const a = document.createElement('a');
       a.href = url;
       a.download = `Tally_${realVoucherType}_${isVoucherwise ? 'Voucherwise' : 'Itemwise'}_Template.xlsx`;
+      a.click();
+      window.URL.revokeObjectURL(url);
+      return;
+    }
+
+    if (type.toLowerCase() === 'journal') {
+      const headers = [
+        'Voucher Date', 'Voucher No', 'Ledger Name', 'Dr/Cr', 'Amount', 'Narration', 'Reference', 'Cost Centre', 'Bill Reference', 'Remarks'
+      ];
+      const sampleData = [
+        {
+          'Voucher Date': new Date().toLocaleDateString('en-GB'),
+          'Voucher No': 'JV-001',
+          'Ledger Name': 'Rent Expense',
+          'Dr/Cr': 'Dr',
+          'Amount': 25000,
+          'Narration': 'Rent entry',
+          'Reference': 'Ref1',
+          'Cost Centre': '',
+          'Bill Reference': '',
+          'Remarks': ''
+        },
+        {
+          'Voucher Date': new Date().toLocaleDateString('en-GB'),
+          'Voucher No': 'JV-001',
+          'Ledger Name': 'HDFC Bank',
+          'Dr/Cr': 'Cr',
+          'Amount': 25000,
+          'Narration': 'Rent entry',
+          'Reference': 'Ref1',
+          'Cost Centre': '',
+          'Bill Reference': '',
+          'Remarks': ''
+        }
+      ];
+
+      const wb = new ExcelJS.Workbook();
+      const templateSheet = wb.addWorksheet('Template');
+      templateSheet.getRow(1).values = headers;
+      templateSheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFF' } };
+      templateSheet.getRow(1).fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: '1F2937' }
+      };
+
+      sampleData.forEach(row => {
+        const rowValues = headers.map(h => row[h as keyof typeof row] !== undefined ? row[h as keyof typeof row] : '');
+        templateSheet.addRow(rowValues);
+      });
+
+      const DEFAULT_LEDGERS = ['Rent Expense', 'HDFC Bank', 'Sundry Debtors', 'Sundry Creditors', 'Sales Account', 'Purchase Account', 'Cash-in-hand', 'CGST Output 9%', 'SGST Output 9%', 'CGST Input 9%', 'SGST Input 9%', 'Freight Charges', 'Packing Expenses', 'Round Off A/c'];
+      const ledgersList = (tallyContext && tallyContext.ledgers && tallyContext.ledgers.length > 0)
+        ? tallyContext.ledgers
+        : DEFAULT_LEDGERS;
+
+      const mastersSheet = wb.addWorksheet('Tally_Masters');
+      mastersSheet.state = 'hidden';
+      mastersSheet.getRow(1).values = ['Ledgers', 'DrCr'];
+      ledgersList.forEach((l, idx) => {
+        mastersSheet.getCell(`A${idx + 2}`).value = l;
+      });
+      mastersSheet.getCell('B2').value = 'Dr';
+      mastersSheet.getCell('B3').value = 'Cr';
+
+      applyDropdownByHeader(templateSheet, headers, 'Ledger Name', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$A$2:$A$${ledgersList.length + 1}`]
+      });
+
+      applyDropdownByHeader(templateSheet, headers, 'Dr/Cr', {
+        type: 'list',
+        allowBlank: true,
+        formulae: [`Tally_Masters!$B$2:$B$3`]
+      });
+
+      // Auto-adjust column widths
+      templateSheet.columns.forEach(col => {
+        let maxLen = 0;
+        col.eachCell({ includeEmpty: true }, (cell) => {
+          const valStr = cell.value ? String(cell.value) : '';
+          if (valStr.length > maxLen) maxLen = valStr.length;
+        });
+        col.width = Math.max(maxLen + 3, 12);
+      });
+
+      const buffer = await wb.xlsx.writeBuffer();
+      const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Tally_Journal_Template.xlsx`;
       a.click();
       window.URL.revokeObjectURL(url);
       return;
@@ -3050,7 +3814,28 @@ export default function App() {
               const invoices = processSalesPurchaseExcel(jsonData);
               invoices.forEach(inv => recalculateInvoice(inv, companyState));
               setSalesPurchaseInvoices(invoices);
+              setSalesPurchaseBalancingErrors([]);
               setCurrentStep('sales-purchase-verification');
+              setIsProcessing(false);
+              return;
+            }
+
+            const isJournal = headers.some(h => {
+              const hLower = h.toLowerCase().trim();
+              return hLower === 'dr/cr' || hLower === 'dr_cr' || hLower === 'dr_or_cr' || hLower === 'dr/cr selection' || hLower.includes('dr/cr');
+            });
+
+            if (isJournal) {
+              const groups = parseJournalExcel(jsonData);
+              setJournalGroups(groups);
+              setSelectedJournalGroupIdx(0);
+              
+              const hasErrors = groups.some(g => !g.isValid);
+              if (hasErrors) {
+                generateJournalErrorExcel(groups);
+              }
+              
+              setCurrentStep('journal-verification');
               setIsProcessing(false);
               return;
             }
@@ -4199,6 +4984,16 @@ export default function App() {
         throw new Error(`Invoice No "${errorInvoice.invoiceNo}" has errors. Please fix all errors before generating XML.`);
       }
 
+      // Check balancing
+      const balancingResults = invoicesToUse.map(inv => verifySalesPurchaseBalancing(inv));
+      const unbalanced = balancingResults.filter(r => !r.isBalanced);
+      if (unbalanced.length > 0) {
+        setSalesPurchaseBalancingErrors(unbalanced);
+        throw new Error(`XML generation blocked: ${unbalanced.length} Sales/Purchase invoice(s) are unbalanced.`);
+      } else {
+        setSalesPurchaseBalancingErrors([]);
+      }
+
       const conversionPayload: any = {
         fileName: pendingFileName,
         status: 'processing',
@@ -4256,6 +5051,26 @@ export default function App() {
       }));
       const ws = XLSX.utils.json_to_sheet(exportRows);
       XLSX.utils.book_append_sheet(wb, ws, "Reviewed_Vouchers");
+    } else if (pendingExportType === 'Journal') {
+      const exportRows: any[] = [];
+      journalGroups.forEach(g => {
+        g.lines.forEach(l => {
+          exportRows.push({
+            'Voucher Date': g.voucherDate,
+            'Voucher No': g.voucherNo,
+            'Ledger Name': l.ledgerName,
+            'Dr/Cr': l.drCr,
+            'Amount': l.amount,
+            'Narration': l.narration || '',
+            'Reference': l.reference || '',
+            'Cost Centre': l.costCentre || '',
+            'Bill Reference': l.billReference || '',
+            'Remarks': l.remarks || ''
+          });
+        });
+      });
+      const ws = XLSX.utils.json_to_sheet(exportRows);
+      XLSX.utils.book_append_sheet(wb, ws, "Reviewed_Journal");
     } else {
       const exportRows: any[] = [];
       getReviewedInvoices().forEach(inv => {
@@ -4289,6 +5104,17 @@ export default function App() {
   };
 
   const generateSalesPurchaseXMLFromVerification = async () => {
+    setError(null);
+    const balancingResults = salesPurchaseInvoices.map(inv => verifySalesPurchaseBalancing(inv));
+    const unbalanced = balancingResults.filter(r => !r.isBalanced);
+    if (unbalanced.length > 0) {
+      setSalesPurchaseBalancingErrors(unbalanced);
+      setError(`XML generation blocked: ${unbalanced.length} Sales/Purchase invoice(s) are unbalanced.`);
+      return;
+    } else {
+      setSalesPurchaseBalancingErrors([]);
+    }
+
     checkMissingMastersAndProceed('SalesPurchase');
   };
 
@@ -4731,6 +5557,8 @@ export default function App() {
                     if (pendingExportType === 'Vouchers') {
                       const finalVouchers = getReviewedVouchers();
                       await generateFinalXMLFromVerificationDirect(finalVouchers, true);
+                    } else if (pendingExportType === 'Journal') {
+                      await generateFinalJournalXMLDirect(journalGroups, true);
                     } else {
                       const finalInvoices = getReviewedInvoices();
                       await generateSalesPurchaseXMLFromVerificationDirect(finalInvoices, true);
@@ -4759,6 +5587,8 @@ export default function App() {
                     if (pendingExportType === 'Vouchers') {
                       const finalVouchers = getReviewedVouchers();
                       await generateFinalXMLFromVerificationDirect(finalVouchers, false);
+                    } else if (pendingExportType === 'Journal') {
+                      await generateFinalJournalXMLDirect(journalGroups, false);
                     } else {
                       const finalInvoices = getReviewedInvoices();
                       await generateSalesPurchaseXMLFromVerificationDirect(finalInvoices, false);
@@ -7125,6 +7955,56 @@ export default function App() {
                       </div>
                     </div>
 
+                    {salesPurchaseBalancingErrors.length > 0 && (
+                      <div className="bg-red-50 border border-red-200 rounded-2xl p-5 space-y-3 shadow-sm">
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                          <div className="flex items-center gap-2">
+                            <AlertCircle className="w-5 h-5 text-red-600 shrink-0" />
+                            <h3 className="font-bold text-red-800 text-sm">
+                              Sales/Purchase Voucher-Level Balancing Failed
+                            </h3>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => generateSalesPurchaseBalancingErrorExcel(salesPurchaseBalancingErrors)}
+                            className="px-3 py-1.5 bg-red-100 hover:bg-red-200 text-red-700 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 self-start sm:self-center"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            Download Balancing Error Log
+                          </button>
+                        </div>
+                        <p className="text-xs text-red-700 leading-relaxed">
+                          The following {salesPurchaseBalancingErrors.length} invoice(s) are unbalanced. For each Sales/Purchase voucher, the signed XML ledger amounts must sum to zero before XML generation is allowed.
+                        </p>
+                        <div className="overflow-x-auto border border-red-200 rounded-xl bg-white">
+                          <table className="w-full text-left border-collapse text-xs">
+                            <thead>
+                              <tr className="bg-red-50/50 border-b border-red-200 font-bold text-red-800">
+                                <th className="p-2.5">Invoice No</th>
+                                <th className="p-2.5 text-right">Debit Total</th>
+                                <th className="p-2.5 text-right">Credit Total</th>
+                                <th className="p-2.5 text-right">Expected Party Amount</th>
+                                <th className="p-2.5 text-right">Actual Party Amount</th>
+                                <th className="p-2.5 text-right">Difference</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-red-100 font-mono">
+                              {salesPurchaseBalancingErrors.map((err, errIdx) => (
+                                <tr key={errIdx} className="text-red-700 hover:bg-red-50/30">
+                                  <td className="p-2.5 font-bold font-sans">{err.invoiceNo || 'Blank'}</td>
+                                  <td className="p-2.5 text-right">₹{err.debitTotal.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                                  <td className="p-2.5 text-right">₹{err.creditTotal.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                                  <td className="p-2.5 text-right">₹{err.expectedPartyAmount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                                  <td className="p-2.5 text-right">₹{err.actualPartyAmount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                                  <td className="p-2.5 text-right font-bold text-red-800">₹{err.difference.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+
                     <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
                       {/* Left Sidebar: Invoice list */}
                       <div className="lg:col-span-1 space-y-3">
@@ -7959,6 +8839,318 @@ export default function App() {
                             </>
                           )}
                         </button>
+                      </div>
+                    </div>
+                  </motion.section>
+                );
+              })()}
+
+              {currentStep === 'journal-verification' && (() => {
+                const activeGroup = journalGroups[selectedJournalGroupIdx];
+                const ledgersList = tallyContext?.ledgers || DEFAULT_LEDGERS;
+
+                return (
+                  <motion.section
+                    key="journal-verification"
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -10 }}
+                    className="bg-white p-6 rounded-2xl border border-zinc-200 shadow-sm space-y-6"
+                  >
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-zinc-100 pb-5">
+                      <div>
+                        <h2 className="text-xl font-bold flex items-center gap-2 text-zinc-900">
+                          <CheckCircle2 className="w-5 h-5 text-emerald-600" />
+                          Journal Voucher Review and Verification
+                        </h2>
+                        <p className="text-xs text-zinc-500 mt-1 leading-relaxed">
+                          Review and edit multi-line journal entries. All debit/credit totals must balance before generating the final XML.
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() => generateJournalErrorExcel(journalGroups)}
+                          className="px-3.5 py-2 border border-red-200 text-red-700 bg-red-50 hover:bg-red-100 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5"
+                        >
+                          <AlertCircle className="w-4 h-4" />
+                          Download Error Log
+                        </button>
+                        <span className="text-xs bg-zinc-100 text-zinc-700 border border-zinc-200 px-3 py-1.5 rounded-lg font-bold flex items-center">
+                          {journalGroups.length} Journal Vouchers Ready
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                      {/* Left: Voucher List */}
+                      <div className="lg:col-span-1 border border-zinc-200 rounded-xl overflow-hidden bg-zinc-50 flex flex-col max-h-[600px]">
+                        <div className="p-3 bg-white border-b border-zinc-200 font-bold text-zinc-700 text-xs uppercase tracking-wider">
+                          Voucher List
+                        </div>
+                        <div className="overflow-y-auto divide-y divide-zinc-200/60 flex-1">
+                          {journalGroups.map((grp, idx) => {
+                            const isSelected = idx === selectedJournalGroupIdx;
+                            const hasErrors = !grp.isValid;
+                            return (
+                              <button
+                                key={idx}
+                                type="button"
+                                onClick={() => setSelectedJournalGroupIdx(idx)}
+                                className={`w-full p-3 text-left transition-all flex flex-col gap-1.5 hover:bg-zinc-100 ${
+                                  isSelected ? 'bg-zinc-200/70 hover:bg-zinc-200/70 border-l-4 border-zinc-900 pl-2' : ''
+                                }`}
+                              >
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="font-bold text-zinc-800 text-xs">
+                                    {grp.voucherNo || `Unnumbered (${idx + 1})`}
+                                  </span>
+                                  <span className="text-[10px] text-zinc-500 font-mono">
+                                    {grp.voucherDate}
+                                  </span>
+                                </div>
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="text-[11px] text-zinc-600">
+                                    Lines: {grp.lines.length}
+                                  </span>
+                                  <span className={`text-[10px] px-2 py-0.5 rounded-md font-bold ${
+                                    hasErrors 
+                                      ? 'bg-red-50 text-red-700 border border-red-100' 
+                                      : 'bg-emerald-50 text-emerald-700 border border-emerald-100'
+                                  }`}>
+                                    {hasErrors ? 'Mismatch' : 'Balanced'}
+                                  </span>
+                                </div>
+                                <div className="text-[10px] text-zinc-500 font-mono flex justify-between">
+                                  <span>Dr: ₹{grp.totalDebit.toLocaleString('en-IN')}</span>
+                                  <span>Cr: ₹{grp.totalCredit.toLocaleString('en-IN')}</span>
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Right: Active Voucher Detail Form */}
+                      <div className="lg:col-span-2 space-y-4">
+                        {activeGroup ? (
+                          <div className="border border-zinc-200 rounded-xl p-5 bg-white space-y-5">
+                            {/* Header details */}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                              <div>
+                                <label className="text-[11px] font-bold text-zinc-500 block mb-1 uppercase tracking-wider">Voucher Date</label>
+                                <input
+                                  type="text"
+                                  value={activeGroup.voucherDate}
+                                  placeholder="DD-MM-YYYY"
+                                  onChange={e => updateJournalGroupHeader(selectedJournalGroupIdx, { voucherDate: e.target.value })}
+                                  className="w-full px-3 py-2 border border-zinc-200 rounded-xl focus:border-zinc-900 focus:ring-1 focus:ring-zinc-900 outline-none text-xs font-semibold text-zinc-800"
+                                />
+                              </div>
+                              <div>
+                                <label className="text-[11px] font-bold text-zinc-500 block mb-1 uppercase tracking-wider">Voucher No</label>
+                                <input
+                                  type="text"
+                                  value={activeGroup.voucherNo}
+                                  onChange={e => updateJournalGroupHeader(selectedJournalGroupIdx, { voucherNo: e.target.value })}
+                                  className="w-full px-3 py-2 border border-zinc-200 rounded-xl focus:border-zinc-900 focus:ring-1 focus:ring-zinc-900 outline-none text-xs font-semibold text-zinc-800"
+                                />
+                              </div>
+                            </div>
+
+                            {/* Ledger lines table */}
+                            <div className="space-y-3">
+                              <div className="flex items-center justify-between pb-1 border-b border-zinc-100">
+                                <h3 className="font-bold text-zinc-800 text-xs uppercase tracking-wider">Ledger Lines</h3>
+                                <button
+                                  type="button"
+                                  onClick={() => addJournalLine(selectedJournalGroupIdx)}
+                                  className="px-2.5 py-1 text-[11px] bg-zinc-900 text-white rounded-lg hover:bg-zinc-800 transition-colors font-bold"
+                                >
+                                  + Add Ledger Line
+                                </button>
+                              </div>
+
+                              <div className="overflow-x-auto border border-zinc-200 rounded-xl">
+                                <table className="w-full text-left border-collapse text-xs">
+                                  <thead>
+                                    <tr className="bg-zinc-50 border-b border-zinc-200 font-bold text-zinc-600">
+                                      <th className="p-2.5 w-16 text-center">Dr/Cr</th>
+                                      <th className="p-2.5 min-w-[200px]">Ledger Name</th>
+                                      <th className="p-2.5 w-28">Amount</th>
+                                      <th className="p-2.5 w-24">Cost Centre</th>
+                                      <th className="p-2.5 w-24">Bill Ref</th>
+                                      <th className="p-2.5 w-20">Remarks</th>
+                                      <th className="p-2.5 w-12 text-center">Del</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody className="divide-y divide-zinc-100">
+                                    {activeGroup.lines.map((line, lIdx) => (
+                                      <tr key={lIdx} className={line.excluded ? 'opacity-40' : ''}>
+                                        <td className="p-2">
+                                          <select
+                                            value={line.drCr}
+                                            onChange={e => updateJournalLine(selectedJournalGroupIdx, lIdx, { drCr: e.target.value as any })}
+                                            className="w-full p-1 border border-zinc-200 rounded-md bg-white text-xs font-bold"
+                                          >
+                                            <option value="Dr">Dr</option>
+                                            <option value="Cr">Cr</option>
+                                          </select>
+                                        </td>
+                                        <td className="p-2">
+                                          <div className="relative">
+                                            <input
+                                              type="text"
+                                              value={line.ledgerName}
+                                              onChange={e => updateJournalLine(selectedJournalGroupIdx, lIdx, { ledgerName: e.target.value })}
+                                              className="w-full px-2 py-1 border border-zinc-200 rounded-md text-xs font-semibold"
+                                              placeholder="Search/type ledger..."
+                                              list={`journal-ledgers-list-${selectedJournalGroupIdx}-${lIdx}`}
+                                            />
+                                            <datalist id={`journal-ledgers-list-${selectedJournalGroupIdx}-${lIdx}`}>
+                                              {ledgersList.map(item => (
+                                                <option key={item} value={item} />
+                                              ))}
+                                            </datalist>
+                                            {line.ledgerName && !ledgersList.some(m => m.toLowerCase() === line.ledgerName.toLowerCase()) && (
+                                              <span className="absolute right-2 top-1.5 text-[9px] bg-amber-50 text-amber-700 border border-amber-100 px-1.5 py-0.2 rounded font-bold">
+                                                New
+                                              </span>
+                                            )}
+                                          </div>
+                                        </td>
+                                        <td className="p-2">
+                                          <input
+                                            type="number"
+                                            value={line.amount || ''}
+                                            onChange={e => updateJournalLine(selectedJournalGroupIdx, lIdx, { amount: parseFloat(e.target.value) || 0 })}
+                                            className="w-full px-2 py-1 border border-zinc-200 rounded-md text-xs font-semibold text-right"
+                                          />
+                                        </td>
+                                        <td className="p-2">
+                                          <input
+                                            type="text"
+                                            value={line.costCentre || ''}
+                                            onChange={e => updateJournalLine(selectedJournalGroupIdx, lIdx, { costCentre: e.target.value })}
+                                            className="w-full px-2 py-1 border border-zinc-200 rounded-md text-xs"
+                                            placeholder="None"
+                                          />
+                                        </td>
+                                        <td className="p-2">
+                                          <input
+                                            type="text"
+                                            value={line.billReference || ''}
+                                            onChange={e => updateJournalLine(selectedJournalGroupIdx, lIdx, { billReference: e.target.value })}
+                                            className="w-full px-2 py-1 border border-zinc-200 rounded-md text-xs"
+                                            placeholder="None"
+                                          />
+                                        </td>
+                                        <td className="p-2">
+                                          <input
+                                            type="text"
+                                            value={line.remarks || ''}
+                                            onChange={e => updateJournalLine(selectedJournalGroupIdx, lIdx, { remarks: e.target.value })}
+                                            className="w-full px-2 py-1 border border-zinc-200 rounded-md text-xs"
+                                            placeholder="None"
+                                          />
+                                        </td>
+                                        <td className="p-2 text-center">
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              const updatedLines = [...activeGroup.lines];
+                                              updatedLines.splice(lIdx, 1);
+                                              setJournalGroups(prev => {
+                                                const copy = [...prev];
+                                                copy[selectedJournalGroupIdx] = { ...copy[selectedJournalGroupIdx], lines: updatedLines };
+                                                return copy;
+                                              });
+                                              setTimeout(() => {
+                                                updateJournalLine(selectedJournalGroupIdx, 0, {});
+                                              }, 10);
+                                            }}
+                                            className="p-1 text-red-500 hover:text-red-700 rounded transition-colors"
+                                            title="Delete Line"
+                                          >
+                                            <Trash2 className="w-3.5 h-3.5" />
+                                          </button>
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </div>
+
+                            {/* Summary info */}
+                            <div className="bg-zinc-50 border border-zinc-150 p-4 rounded-xl flex flex-col md:flex-row justify-between gap-4">
+                              <div className="space-y-1">
+                                <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider block">Voucher Totals</span>
+                                <div className="flex gap-4 text-xs font-bold text-zinc-700">
+                                  <div>Total Debit: <span className="text-zinc-900 font-mono">₹{activeGroup.totalDebit.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</span></div>
+                                  <div>Total Credit: <span className="text-zinc-900 font-mono">₹{activeGroup.totalCredit.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</span></div>
+                                </div>
+                              </div>
+                              <div className="text-right space-y-1">
+                                <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider block">Difference</span>
+                                <div className={`text-xs font-bold px-3 py-1 rounded-lg inline-block font-mono ${
+                                  Math.abs(activeGroup.difference) <= 0.001
+                                    ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                    : 'bg-red-50 text-red-700 border border-red-200'
+                                }`}>
+                                  ₹{activeGroup.difference.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* Error messaging list */}
+                            {(activeGroup.errors.length > 0 || activeGroup.warnings.length > 0) && (
+                              <div className="space-y-2 p-4 bg-zinc-50 border border-zinc-200 rounded-xl text-[11px]">
+                                {activeGroup.errors.map((err, i) => (
+                                  <div key={i} className="text-red-600 font-medium flex items-center gap-1.5">
+                                    <span className="w-1.5 h-1.5 bg-red-500 rounded-full shrink-0"></span>
+                                    {err}
+                                  </div>
+                                ))}
+                                {activeGroup.warnings.map((warn, i) => (
+                                  <div key={i} className="text-amber-700 font-medium flex items-center gap-1.5">
+                                    <span className="w-1.5 h-1.5 bg-amber-500 rounded-full shrink-0"></span>
+                                    {warn}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+
+                            {/* Action Row */}
+                            <div className="flex items-center justify-between pt-2 border-t border-zinc-100">
+                              <span className="text-[11px] text-zinc-400">
+                                Voucher Row Source: {activeGroup.lines.map(l => l.rowNo).join(', ')}
+                              </span>
+                              <button
+                                type="button"
+                                disabled={isProcessing || journalGroups.some(g => !g.isValid)}
+                                onClick={() => checkMissingMastersAndProceedJournal(journalGroups)}
+                                className="px-6 py-2.5 bg-zinc-950 hover:bg-zinc-800 disabled:opacity-40 text-white rounded-xl text-xs font-bold transition-all shadow-sm flex items-center gap-1.5"
+                              >
+                                {isProcessing ? (
+                                  <>
+                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                    Processing...
+                                  </>
+                                ) : (
+                                  <>
+                                    <CheckCircle2 className="w-3.5 h-3.5" />
+                                    Confirm & Generate Journal XML
+                                  </>
+                                )}
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="h-48 border border-zinc-200 rounded-xl bg-zinc-50 flex items-center justify-center text-xs text-zinc-400">
+                            Select a voucher from the list to view and edit details
+                          </div>
+                        )}
                       </div>
                     </div>
                   </motion.section>
