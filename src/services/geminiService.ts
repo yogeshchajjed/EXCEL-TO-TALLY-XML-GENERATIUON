@@ -40,7 +40,7 @@ export function getLocalColumnMapping(headers: string[]): ColumnMapping[] {
     VOUCHERTYPENAME: ['voucher type', 'vouchertype', 'type', 'vch type', 'vouchertype name'],
     VOUCHERNUMBER: ['voucher number', 'vouchernumber', 'vch no', 'voucher no', 'no', 'vch_no'],
     AMOUNT: ['amount', 'transaction amount', 'credit', 'debit', 'value', 'total'],
-    NARRATION: ['narration', 'description', 'particulars', 'transaction details', 'details', 'remarks', 'narr'],
+    NARRATION: ['narration', 'description', 'transaction details', 'details', 'remarks', 'narr'],
     REFERENCE: ['reference', 'ref no', 'utr', 'cheque no', 'instrument no', 'transaction id', 'ref', 'chq no']
   };
 
@@ -67,6 +67,19 @@ export function getLocalColumnMapping(headers: string[]): ColumnMapping[] {
         tallyField: field,
         confidence: 0.95,
         reasoning: `Deterministic match for ${field} using local mapping engine.`
+      });
+    }
+  }
+
+  // Fallback: If NARRATION is not mapped, and a column called 'particulars' exists, and we didn't map NARRATION to anything else
+  if (!mappings.some(m => m.tallyField === 'NARRATION')) {
+    const particularsHeader = headers.find(h => h.toLowerCase().trim() === 'particulars');
+    if (particularsHeader) {
+      mappings.push({
+        excelColumn: particularsHeader,
+        tallyField: 'NARRATION',
+        confidence: 0.8,
+        reasoning: `No dedicated narration/description column found; falling back to 'particulars' as description.`
       });
     }
   }

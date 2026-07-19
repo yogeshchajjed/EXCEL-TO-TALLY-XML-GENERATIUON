@@ -43,6 +43,7 @@ import {
   Loader2,
   Sparkles,
   ArrowRight,
+  ArrowLeft,
   FileCode,
   Database,
   FileUp,
@@ -67,6 +68,7 @@ import {
   generateStockGroupsXML, 
   generateUnitsXML, 
   normalizeTallyDate,
+  getFinalXMLNarration,
   TallyVoucher, 
   TallyLedgerMaster, 
   TallyStockItemMaster, 
@@ -607,6 +609,14 @@ export default function App() {
   const [aiMappedTransactions, setAiMappedTransactions] = useState<MappedTransaction[]>([]);
   const [verificationRows, setVerificationRows] = useState<any[]>([]);
   const [verificationSourceStep, setVerificationSourceStep] = useState<'bank-statement-review' | 'mapping'>('mapping');
+  const [useLedgerAsNarration, setUseLedgerAsNarration] = useState(false);
+  const [bankSearchTerm, setBankSearchTerm] = useState('');
+  const [bankFilterType, setBankFilterType] = useState('All');
+  const [bankShowAttentionRequiredFirst, setBankShowAttentionRequiredFirst] = useState(true);
+  const [confirmProceedWithSuspense, setConfirmProceedWithSuspense] = useState(false);
+  const [bankCompactRowHeight, setBankCompactRowHeight] = useState(false);
+  const [bankStatementValidationErrors, setBankStatementValidationErrors] = useState<{ rowNo: number; issue: string; suggestedFix: string }[]>([]);
+  const [bankSuccessMessage, setBankSuccessMessage] = useState<string | null>(null);
 
   const updateVerificationRowLedger = (idx: number, ledgerName: string) => {
     // 1. Update verificationRows state
@@ -971,10 +981,17 @@ export default function App() {
 
   const checkMissingMastersAndProceedJournal = (groups: JournalVoucherGroup[]) => {
     setError(null);
+    const validGroups = groups.filter(g => g.isValid);
+    if (validGroups.length === 0) {
+      setError("No valid, balanced Journal vouchers available to export. Please correct errors.");
+      setIsProcessing(false);
+      return;
+    }
+
     const ledgersList = tallyContext?.ledgers || [];
     const usedLedgers: { name: string; source: string; type: string }[] = [];
 
-    groups.forEach(g => {
+    validGroups.forEach(g => {
       const sourceId = g.voucherNo ? `Journal No: ${g.voucherNo}` : `Journal Voucher`;
       g.lines.forEach(l => {
         if (!l.excluded && l.ledgerName) {
@@ -992,7 +1009,7 @@ export default function App() {
       setShowMissingMastersReview(true);
       setIsProcessing(false);
     } else {
-      generateFinalJournalXMLDirect(groups);
+      generateFinalJournalXMLDirect(validGroups);
     }
   };
 
@@ -2943,7 +2960,7 @@ export default function App() {
       }
     }
 
-    const hasSuspense = isValidLedger('Suspense Account');
+    const suspenseLedger = context.ledgers.find(l => /^suspense$/i.test(l) || /^suspense account$/i.test(l));
 
     // Rule: Where system is less than 90% sure about ledger name, select Suspense Account (if available).
     if (candidateLedger && candidateConfidence >= 0.90) {
@@ -2953,21 +2970,17 @@ export default function App() {
         reasoning: candidateReasoning
       };
     } else {
-      if (hasSuspense) {
+      if (suspenseLedger) {
         return {
-          ledgerName: 'Suspense Account',
+          ledgerName: suspenseLedger,
           confidence: candidateLedger ? candidateConfidence : 0,
-          reasoning: candidateLedger 
-            ? `Match found ("${candidateLedger}" with ${(candidateConfidence*100).toFixed(0)}% confidence) is below 90% threshold. Fallback to Suspense.`
-            : 'No reliable local match. Fallback to Suspense.'
+          reasoning: "Low confidence. Suspense selected. Please review."
         };
       } else {
         return {
           ledgerName: '',
           confidence: candidateLedger ? candidateConfidence : 0,
-          reasoning: candidateLedger
-            ? `Match found ("${candidateLedger}" with ${(candidateConfidence*100).toFixed(0)}% confidence) is below 90% threshold. "Suspense Account" not found.`
-            : 'No reliable local match. "Suspense Account" not found.'
+          reasoning: "Low confidence. Please review. (Needs Review)"
         };
       }
     }
@@ -2979,7 +2992,7 @@ export default function App() {
 
   const autoDetectBankStatement = (rows: any[][]) => {
     const DATE_ALIASES = ['date', 'txn date', 'transaction date', 'value date', 'posting date', 'entry date'];
-    const NARRATION_ALIASES = ['narration', 'description', 'particulars', 'transaction details', 'details', 'remarks', 'description/narration'];
+    const NARRATION_ALIASES = ['narration', 'description', 'transaction details', 'details', 'remarks', 'description/narration'];
     const DEBIT_ALIASES = ['debit', 'withdrawal', 'withdrawals', 'paid out', 'dr', 'debit amount', 'withdrawal amount', 'payment', 'payment amount'];
     const CREDIT_ALIASES = ['credit', 'deposit', 'deposits', 'paid in', 'cr', 'credit amount', 'deposit amount', 'receipt', 'receipt amount'];
     const AMOUNT_ALIASES = ['amount', 'transaction amount', 'txn amount', 'value', 'amt'];
@@ -3081,7 +3094,7 @@ export default function App() {
 
       if (mappings.date === null && str.includes('date')) {
         mappings.date = c;
-      } else if (mappings.narration === null && (str.includes('narr') || str.includes('desc') || str.includes('part') || str.includes('detail') || str.includes('remark'))) {
+      } else if (mappings.narration === null && (str.includes('narr') || str.includes('desc') || str.includes('detail') || str.includes('remark'))) {
         mappings.narration = c;
       } else if (mappings.debit === null && (str.includes('debit') || str.includes('withdr') || str.includes('paid out'))) {
         mappings.debit = c;
@@ -3097,6 +3110,16 @@ export default function App() {
         mappings.balance = c;
       }
     });
+
+    if (mappings.narration === null) {
+      headerRow.forEach((val, c) => {
+        if (val === undefined || val === null) return;
+        const str = String(val).toLowerCase().trim();
+        if (str.includes('particulars') || str.includes('part')) {
+          mappings.narration = c;
+        }
+      });
+    }
 
     let dataStartRowIdx = bestHeaderRowIdx + 1;
     while (dataStartRowIdx < rows.length) {
@@ -3247,14 +3270,17 @@ export default function App() {
     };
 
     const DATE_HEADERS = ['date', 'txn date', 'transaction date', 'value date', 'posting date'];
-    const NARRATION_HEADERS = ['narration', 'description', 'particulars', 'transaction details', 'details', 'remarks'];
+    const NARRATION_HEADERS = ['narration', 'description', 'transaction details', 'details', 'remarks'];
     const DEBIT_HEADERS = ['debit', 'withdrawal', 'withdrawals', 'paid out', 'dr', 'debit amount'];
     const CREDIT_HEADERS = ['credit', 'deposit', 'deposits', 'paid in', 'cr', 'credit amount'];
     const AMOUNT_HEADERS = ['amount', 'transaction amount'];
     const REF_HEADERS = ['reference', 'ref no', 'utr', 'cheque no', 'instrument no', 'transaction id'];
 
     const dateCol = getHeaderKey(DATE_HEADERS);
-    const descCol = getHeaderKey(NARRATION_HEADERS);
+    let descCol = getHeaderKey(NARRATION_HEADERS);
+    if (!descCol) {
+      descCol = headers.find(h => h.toLowerCase().trim() === 'particulars') || null;
+    }
     const debitCol = getHeaderKey(DEBIT_HEADERS);
     const creditCol = getHeaderKey(CREDIT_HEADERS);
     const amtCol = getHeaderKey(AMOUNT_HEADERS);
@@ -3396,27 +3422,98 @@ export default function App() {
   const handleBankStatementGenerateXML = async () => {
     setIsProcessing(true);
     setError(null);
+    setBankStatementValidationErrors([]);
 
     try {
-      const validRows = bankStatementRows.filter(row => !row.excluded && row.status !== 'invalid');
-      if (validRows.length === 0) {
-        throw new Error("No valid, non-excluded bank statement rows available to generate XML.");
+      // 1. Get included rows
+      const includedRows = bankStatementRows.filter(row => !row.excluded);
+      if (includedRows.length === 0) {
+        throw new Error("No non-excluded bank statement rows selected for XML generation.");
       }
 
-      const missingLedgerRow = validRows.find(row => !row.userLedger);
-      if (missingLedgerRow) {
-        throw new Error(`Row ${missingLedgerRow.rowNo} has no Particulars Ledger selected. Please select a ledger.`);
+      // 2. Perform validations
+      const validationErrs: { rowNo: number; issue: string; suggestedFix: string }[] = [];
+
+      // Requirement 8: Bank/Cash ledger not selected
+      if (!selectedBankLedger) {
+        validationErrs.push({
+          rowNo: 0,
+          issue: "Bank/Cash ledger not selected",
+          suggestedFix: "Please select a Bank / Cash Ledger from the top of the mapping screen or current workspace."
+        });
       }
 
-      const rows = validRows.map(row => {
+      // Check each included row
+      includedRows.forEach(row => {
+        // Date validation
         const dateNorm = normalizeTallyDate(row.date);
         if (!dateNorm.isValid) {
-          throw new Error(`Row ${row.rowNo}: Date "${row.date}" could not be parsed: ${dateNorm.error}`);
+          validationErrs.push({
+            rowNo: row.rowNo,
+            issue: `Invalid date: "${row.date}"`,
+            suggestedFix: "Correct the date format to DD-MM-YYYY or DD/MM/YYYY."
+          });
         }
-        const vType = row.detectedVoucherType === 'Unknown' ? 'Payment' : row.detectedVoucherType;
+
+        // Voucher type validation
+        if (!row.detectedVoucherType || row.detectedVoucherType === 'Unknown') {
+          validationErrs.push({
+            rowNo: row.rowNo,
+            issue: "Voucher Type missing or unknown",
+            suggestedFix: "Ensure the transaction is classified as either Payment or Receipt."
+          });
+        }
+
+        // Amount validation
+        if (row.amount === null || row.amount === undefined || row.amount <= 0) {
+          validationErrs.push({
+            rowNo: row.rowNo,
+            issue: "Amount missing or zero",
+            suggestedFix: "Enter a valid positive number for debit or credit amount."
+          });
+        }
+
+        // Final Ledger blank validation
+        if (!row.userLedger || !row.userLedger.trim()) {
+          validationErrs.push({
+            rowNo: row.rowNo,
+            issue: "Final Ledger (Particulars) is blank",
+            suggestedFix: "Select or type a valid ledger for this transaction."
+          });
+        }
+
+        // Suspense confirmation validation
+        const isSuspense = row.userLedger && /suspense/i.test(row.userLedger);
+        if (isSuspense && !confirmProceedWithSuspense) {
+          validationErrs.push({
+            rowNo: row.rowNo,
+            issue: "Suspense row exists and is not confirmed",
+            suggestedFix: "Confirm 'Proceed with Suspense' at the bottom of the screen or map to a different ledger."
+          });
+        }
+      });
+
+      // Also check for blocked invalid rows in general if they are included
+      const invalidIncluded = includedRows.find(row => row.status === 'invalid');
+      if (invalidIncluded) {
+        validationErrs.push({
+          rowNo: invalidIncluded.rowNo,
+          issue: "Row has critical invalid state: " + (invalidIncluded.errorMsg || "unrecognized format"),
+          suggestedFix: "Please exclude this row or fix the columns before exporting."
+        });
+      }
+
+      if (validationErrs.length > 0) {
+        setBankStatementValidationErrors(validationErrs);
+        throw new Error("Validation failed. Please review and correct the row-wise error summary below.");
+      }
+
+      // 3. Build verificationRows
+      const rows = includedRows.map(row => {
+        const dateNorm = normalizeTallyDate(row.date);
         return {
           rowNo: row.rowNo,
-          voucherType: vType,
+          voucherType: row.detectedVoucherType,
           originalDate: row.date,
           normalizedDate: dateNorm.value,
           finalLedger: row.userLedger,
@@ -3430,10 +3527,11 @@ export default function App() {
 
       setVerificationRows(rows);
       setVerificationSourceStep('bank-statement-review');
-      setCurrentStep('verification');
-      setIsProcessing(false);
+
+      // 4. Pass the newly built rows directly to checkMissingMastersAndProceed to prevent React state cycle lag
+      checkMissingMastersAndProceed('Vouchers', rows);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Verification failed");
+      setError(err instanceof Error ? err.message : "XML generation failed");
       setIsProcessing(false);
     }
   };
@@ -3606,6 +3704,13 @@ export default function App() {
         // Get enhanced ledger suggestion
         const suggestion = suggestLedgerForNarrationEnhanced(description, tallyContext);
         
+        let rowStatus = status;
+        let rowErrorMsg = errorMsg;
+        if (rowStatus === 'valid' && !suggestion.ledgerName) {
+          rowStatus = 'warning';
+          rowErrorMsg = 'Needs Review';
+        }
+
         results.push({
           rowNo: r + 1, // Excel row number (1-indexed)
           date: dateStr,
@@ -3619,8 +3724,8 @@ export default function App() {
           confidence: Math.round(suggestion.confidence * 100),
           userLedger: suggestion.ledgerName,
           reference,
-          status,
-          errorMsg,
+          status: rowStatus,
+          errorMsg: rowErrorMsg,
           excluded,
           reasoning: suggestion.reasoning
         });
@@ -3635,28 +3740,83 @@ export default function App() {
     }
   };
 
-  const downloadReviewedTemplateExcel = () => {
+  const downloadReviewedTemplateExcel = async () => {
     try {
       const validRows = bankStatementRows.filter(row => !row.excluded && row.status !== 'invalid');
       if (validRows.length === 0) {
-        alert("No valid, non-excluded rows available to download.");
+        setError("No valid, non-excluded rows available to download.");
         return;
       }
 
-      const data = validRows.map(row => ({
-        'Date': row.date,
-        'Particulars': row.userLedger,
-        'Voucher Type': row.detectedVoucherType,
-        'Voucher No': '',
-        'Amount': row.amount,
-        'Narration': row.description,
-        'Reference': row.reference
-      }));
+      const wb = new ExcelJS.Workbook();
+      const sheet = wb.addWorksheet('Reviewed_Vouchers');
 
-      const worksheet = XLSX.utils.json_to_sheet(data);
-      const workbook = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(workbook, worksheet, 'Reviewed Vouchers');
-      XLSX.writeFile(workbook, `Reviewed_${pendingFileName || 'BankStatement'}.xlsx`);
+      // Define columns/headers
+      const headers = ['Date', 'Particulars', 'Voucher Type', 'Voucher No', 'Amount', 'Narration', 'Reference'];
+      sheet.getRow(1).values = headers;
+      sheet.getRow(1).font = { bold: true };
+
+      // Set columns for formatting
+      sheet.columns = [
+        { header: 'Date', key: 'Date', width: 12 },
+        { header: 'Particulars', key: 'Particulars', width: 25 },
+        { header: 'Voucher Type', key: 'VoucherType', width: 15 },
+        { header: 'Voucher No', key: 'VoucherNo', width: 12 },
+        { header: 'Amount', key: 'Amount', width: 12 },
+        { header: 'Narration', key: 'Narration', width: 40 },
+        { header: 'Reference', key: 'Reference', width: 15 }
+      ];
+
+      // Add rows
+      validRows.forEach(row => {
+        sheet.addRow({
+          Date: row.date,
+          Particulars: row.userLedger || '',
+          VoucherType: row.detectedVoucherType || 'Payment',
+          VoucherNo: '',
+          Amount: row.amount,
+          Narration: row.description || '',
+          Reference: row.reference || ''
+        });
+      });
+
+      // Handle dropdown validation using Tally Masters
+      const masterLedgers = tallyContext?.ledgers || [];
+      if (masterLedgers.length > 0) {
+        // Create hidden master sheet
+        const masterSheet = wb.addWorksheet('Tally_Masters', { state: 'hidden' });
+        masterLedgers.forEach((ledger, i) => {
+          masterSheet.getCell(i + 1, 1).value = ledger;
+        });
+
+        // Add validation to the Particulars column (column B) for rows 2 to count+1
+        const rowCount = validRows.length;
+        const excelFormula = `Tally_Masters!$A$1:$A$${masterLedgers.length}`;
+        for (let i = 2; i <= rowCount + 1; i++) {
+          const cell = sheet.getCell(i, 2); // Column B is Particulars
+          cell.dataValidation = {
+            type: 'list',
+            allowBlank: true,
+            formulae: [excelFormula],
+            showErrorMessage: true,
+            errorTitle: 'Invalid Ledger',
+            error: 'Please select a valid ledger from Tally Masters.'
+          };
+        }
+      }
+
+      // Download file
+      const buffer = await wb.xlsx.writeBuffer();
+      const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `Reviewed_${pendingFileName || 'BankStatement'}.xlsx`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+      setBankSuccessMessage("Reviewed Excel file downloaded successfully!");
+      setTimeout(() => setBankSuccessMessage(null), 5000);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to download reviewed template excel");
     }
@@ -3917,11 +4077,28 @@ export default function App() {
                 particularsStr = rawParticulars !== undefined && rawParticulars !== null ? String(rawParticulars).trim() : '';
               }
 
+              const refCol = aiMappings.find(m => m.tallyField === 'REFERENCE')?.excelColumn;
+              let referenceStr = '';
+              if (refCol) {
+                const rawRef = getValueByHeader(row, refCol);
+                referenceStr = rawRef !== undefined && rawRef !== null ? String(rawRef).trim() : '';
+              } else {
+                const commonRefHeaders = ['reference', 'ref no', 'utr', 'cheque no', 'instrument no', 'transaction id', 'ref', 'chq no'];
+                for (const h of commonRefHeaders) {
+                  const val = getValueByHeader(row, h);
+                  if (val !== undefined && val !== null && String(val).trim() !== '') {
+                    referenceStr = String(val).trim();
+                    break;
+                  }
+                }
+              }
+
               return {
                 date: String(dateVal),
                 description: String(narration || 'No Narration Found'),
                 amount: isNaN(parsedAmount) ? 0 : parsedAmount,
-                particulars: particularsStr
+                particulars: particularsStr,
+                reference: referenceStr
               };
             });
 
@@ -4775,7 +4952,7 @@ export default function App() {
     return errs;
   };
 
-  const checkMissingMastersAndProceed = (type: 'Vouchers' | 'SalesPurchase') => {
+  const checkMissingMastersAndProceed = (type: 'Vouchers' | 'SalesPurchase', rowsOverride?: any[]) => {
     setError(null);
     const ledgersList = tallyContext?.ledgers || [];
     const stockItemsList = tallyContext?.stockItems || [];
@@ -4785,7 +4962,8 @@ export default function App() {
     const usedStockItems: { name: string; source: string; unit?: string; hsn?: string; gstRate?: number }[] = [];
 
     if (type === 'Vouchers') {
-      verificationRows.forEach((row, idx) => {
+      const targetRows = rowsOverride || verificationRows;
+      targetRows.forEach((row, idx) => {
         const rowId = row.voucherNumber ? `${row.voucherType} No: ${row.voucherNumber}` : `${row.voucherType} Row ${idx + 1}`;
         if (row.finalLedger) {
           usedLedgers.push({ name: row.finalLedger, source: rowId, type: 'Party Ledger' });
@@ -4866,7 +5044,8 @@ export default function App() {
     } else {
       // Proceed directly without missing masters
       if (type === 'Vouchers') {
-        generateFinalXMLFromVerificationDirect(verificationRows);
+        const targetRows = rowsOverride || verificationRows;
+        generateFinalXMLFromVerificationDirect(targetRows);
       } else {
         generateSalesPurchaseXMLFromVerificationDirect(salesPurchaseInvoices);
       }
@@ -4941,7 +5120,7 @@ export default function App() {
         return voucher;
       });
 
-      let xml = generateTallyXML(vouchers);
+      let xml = generateTallyXML(vouchers, useLedgerAsNarration);
       if (includeMasters) {
         xml = generateCombinedImportXML({
           voucherXml: xml,
@@ -6695,257 +6874,629 @@ export default function App() {
                   exit={{ opacity: 0, x: 20 }}
                   className="bg-white p-6 rounded-2xl border border-zinc-200 shadow-sm space-y-6"
                 >
+                  {/* Top Header */}
                   <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-zinc-100 pb-5">
                     <div>
                       <h2 className="text-xl font-bold flex items-center gap-2 text-zinc-900">
                         <Building className="w-5 h-5 text-zinc-800" />
-                        Step 2: Bank Statement Review
+                        Step 2: Bank Statement Ledger Review
                       </h2>
                       <p className="text-xs text-zinc-500 mt-1 leading-relaxed">
-                        Verify transactions, select particulars ledgers, and exclude rows before generating Tally XML.
+                        Verify transactions, toggle payment/receipt, select final ledger accounts, and exclude rows before exporting to Tally XML.
                       </p>
                     </div>
-                    <div className="text-right">
-                      <span className="text-xs bg-zinc-100 px-3 py-1.5 rounded-lg text-zinc-700 font-semibold block md:inline-block">
+                    <div className="text-right flex flex-col items-end gap-1">
+                      <span className="text-xs bg-zinc-100 px-3 py-1.5 rounded-lg text-zinc-700 font-semibold">
                         {pendingFileName}
                       </span>
                     </div>
                   </div>
 
-                  {/* Summary Dashboard widgets */}
+                  {/* Summary Indicators */}
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                     <div className="bg-zinc-50 p-4 rounded-xl border border-zinc-200/50">
                       <p className="text-[10px] uppercase font-bold tracking-wider text-zinc-400">Total Rows</p>
                       <p className="text-xl font-bold text-zinc-800 mt-1">{bankStatementRows.length}</p>
                     </div>
                     <div className="bg-emerald-50/50 p-4 rounded-xl border border-emerald-100">
-                      <p className="text-[10px] uppercase font-bold tracking-wider text-emerald-600">Valid to Import</p>
+                      <p className="text-[10px] uppercase font-bold tracking-wider text-emerald-600">Valid & Included</p>
                       <p className="text-xl font-bold text-emerald-700 mt-1">
-                        {bankStatementRows.filter(r => r.status !== 'invalid' && !r.excluded).length}
+                        {bankStatementRows.filter(r => r.status === 'valid' && !r.excluded).length}
                       </p>
                     </div>
                     <div className="bg-amber-50/50 p-4 rounded-xl border border-amber-100">
-                      <p className="text-[10px] uppercase font-bold tracking-wider text-amber-600">Warnings/Skipped</p>
+                      <p className="text-[10px] uppercase font-bold tracking-wider text-amber-600">Warnings / Excluded</p>
                       <p className="text-xl font-bold text-amber-700 mt-1">
                         {bankStatementRows.filter(r => r.status === 'warning' || r.excluded).length}
                       </p>
                     </div>
                     <div className="bg-rose-50/50 p-4 rounded-xl border border-rose-100">
-                      <p className="text-[10px] uppercase font-bold tracking-wider text-rose-600">Invalid Rows</p>
+                      <p className="text-[10px] uppercase font-bold tracking-wider text-rose-600">Invalid / Needs Review</p>
                       <p className="text-xl font-bold text-rose-700 mt-1">
-                        {bankStatementRows.filter(r => r.status === 'invalid').length}
+                        {bankStatementRows.filter(r => r.status === 'invalid' || (!r.userLedger || !r.userLedger.trim())).length}
                       </p>
                     </div>
                   </div>
 
-                  {/* Desktop view scroll container */}
-                  <div className="border border-zinc-200 rounded-xl overflow-hidden bg-white shadow-sm max-h-[500px] overflow-y-auto">
-                    <table className="w-full text-xs text-left border-collapse">
-                      <thead className="bg-zinc-50 text-zinc-600 uppercase font-bold border-b border-zinc-200 sticky top-0 z-10">
-                        <tr>
-                          <th className="p-3 w-16 text-center">Include</th>
-                          <th className="p-3 w-12 text-center">Row</th>
-                          <th className="p-3 w-24">Date</th>
-                          <th className="p-3 max-w-xs">Narration / Description</th>
-                          <th className="p-3 text-right">Debit (Dr)</th>
-                          <th className="p-3 text-right">Credit (Cr)</th>
-                          <th className="p-3 text-right">Amount</th>
-                          <th className="p-3 text-center">Dr/Cr</th>
-                          <th className="p-3 w-24 text-center">Vch Type</th>
-                          <th className="p-3 w-40">Suggested Ledger</th>
-                          <th className="p-3 w-16 text-center">Conf %</th>
-                          <th className="p-3 w-56">Final Ledger Dropdown</th>
-                          <th className="p-3 w-24">Reference</th>
-                          <th className="p-3 w-32">Status & Error</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-zinc-100">
-                        {bankStatementRows.map((row, idx) => {
-                          const isInvalid = row.status === 'invalid';
-                          const isWarning = row.status === 'warning';
-                          const isExcluded = row.excluded;
-
-                          return (
-                            <tr 
-                              key={idx} 
-                              className={`transition-colors ${
-                                isExcluded 
-                                  ? 'bg-zinc-50/60 text-zinc-400' 
-                                  : isInvalid 
-                                    ? 'bg-rose-50/30' 
-                                    : isWarning 
-                                      ? 'bg-amber-50/20' 
-                                      : 'hover:bg-zinc-50/50'
-                              }`}
-                            >
-                              <td className="p-3 text-center">
-                                <input
-                                  type="checkbox"
-                                  checked={!row.excluded}
-                                  onChange={(e) => {
-                                    const updated = [...bankStatementRows];
-                                    updated[idx].excluded = !e.target.checked;
-                                    setBankStatementRows(updated);
-                                  }}
-                                  className="rounded border-zinc-300 text-zinc-900 focus:ring-zinc-950 w-4 h-4 cursor-pointer"
-                                />
-                              </td>
-                              <td className="p-3 text-center font-mono font-medium">{row.rowNo}</td>
-                              <td className="p-3 font-medium whitespace-nowrap">{row.date}</td>
-                              <td className="p-3 max-w-xs truncate font-medium" title={row.description}>
-                                {row.description}
-                              </td>
-                              <td className="p-3 text-right font-mono font-medium text-rose-600">
-                                {row.debit !== null && row.debit !== undefined ? row.debit.toLocaleString('en-IN', { minimumFractionDigits: 2 }) : '-'}
-                              </td>
-                              <td className="p-3 text-right font-mono font-medium text-emerald-600">
-                                {row.credit !== null && row.credit !== undefined ? row.credit.toLocaleString('en-IN', { minimumFractionDigits: 2 }) : '-'}
-                              </td>
-                              <td className="p-3 text-right font-mono font-bold text-zinc-900">
-                                {row.amount.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
-                              </td>
-                              <td className="p-3 text-center font-mono text-zinc-500 font-semibold">
-                                {row.drCr || (row.detectedVoucherType === 'Payment' ? 'Dr' : 'Cr')}
-                              </td>
-                              <td className="p-3 text-center">
-                                <span className={`inline-block px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider ${
-                                  row.detectedVoucherType === 'Payment'
-                                    ? 'bg-rose-100 text-rose-800'
-                                    : row.detectedVoucherType === 'Receipt'
-                                      ? 'bg-emerald-100 text-emerald-800'
-                                      : 'bg-zinc-100 text-zinc-600'
-                                }`}>
-                                  {row.detectedVoucherType}
-                                </span>
-                              </td>
-                              <td className="p-3 font-medium text-zinc-700 truncate max-w-[150px]" title={row.reasoning || row.suggestedLedger}>
-                                {row.suggestedLedger || <span className="text-zinc-400 italic">No suggestion</span>}
-                              </td>
-                              <td className="p-3 text-center">
-                                <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                                  row.confidence >= 90
-                                    ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                                    : row.confidence >= 50
-                                      ? 'bg-amber-50 text-amber-700 border border-amber-200'
-                                      : 'bg-zinc-100 text-zinc-600'
-                                }`}>
-                                  {row.confidence ? `${row.confidence}%` : '0%'}
-                                </span>
-                              </td>
-                              <td className="p-2">
-                                {tallyContext ? (
-                                  <select
-                                    value={row.userLedger}
-                                    onChange={(e) => {
-                                      const updated = [...bankStatementRows];
-                                      updated[idx].userLedger = e.target.value;
-                                      setBankStatementRows(updated);
-                                    }}
-                                    disabled={isExcluded}
-                                    className="w-full p-2 bg-zinc-50 border border-zinc-200 rounded-lg text-xs outline-none focus:ring-1 focus:ring-zinc-950 disabled:opacity-50"
-                                  >
-                                    <option value="">-- Select Ledger --</option>
-                                    {tallyContext.ledgers.map(l => (
-                                      <option key={l} value={l}>{l}</option>
-                                    ))}
-                                  </select>
-                                ) : (
-                                  <input
-                                    type="text"
-                                    value={row.userLedger}
-                                    onChange={(e) => {
-                                      const updated = [...bankStatementRows];
-                                      updated[idx].userLedger = e.target.value;
-                                      setBankStatementRows(updated);
-                                    }}
-                                    disabled={isExcluded}
-                                    placeholder="Enter ledger name"
-                                    className="w-full p-2 bg-zinc-50 border border-zinc-200 rounded-lg text-xs outline-none focus:ring-1 focus:ring-zinc-950 disabled:opacity-50 font-medium"
-                                  />
-                                )}
-                              </td>
-                              <td className="p-3 font-medium whitespace-nowrap">{row.reference}</td>
-                              <td className="p-3">
-                                {isInvalid && (
-                                  <span className="text-rose-600 font-semibold flex flex-col gap-0.5" title={row.errorMsg}>
-                                    <span className="flex items-center gap-1">
-                                      <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                                      Error
-                                    </span>
-                                    <span className="text-[9px] font-normal text-rose-500 leading-tight block truncate max-w-[120px]">{row.errorMsg}</span>
-                                  </span>
-                                )}
-                                {isWarning && (
-                                  <span className="text-amber-600 font-semibold flex flex-col gap-0.5" title={row.errorMsg}>
-                                    <span className="flex items-center gap-1">
-                                      <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                                      Warning
-                                    </span>
-                                    <span className="text-[9px] font-normal text-amber-500 leading-tight block truncate max-w-[120px]">{row.errorMsg}</span>
-                                  </span>
-                                )}
-                                {!isInvalid && !isWarning && !isExcluded && (
-                                  <span className="text-emerald-600 font-semibold flex items-center gap-1">
-                                    <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                                    Ready
-                                  </span>
-                                )}
-                                {isExcluded && (
-                                  <span className="text-zinc-400 font-semibold">
-                                    Excluded
-                                  </span>
-                                )}
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
+                  {/* Active Bank Ledger Selection & Quick Config */}
+                  <div className="bg-zinc-50 border border-zinc-200/60 p-4 rounded-xl flex flex-col md:flex-row md:items-center justify-between gap-4">
+                    <div className="flex items-center gap-3">
+                      <div className="bg-zinc-900 text-white p-2 rounded-lg shrink-0">
+                        <Building className="w-5 h-5" />
+                      </div>
+                      <div>
+                        <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">Active Bank / Cash Ledger</p>
+                        {tallyContext ? (
+                          <select
+                            value={selectedBankLedger}
+                            onChange={(e) => setSelectedBankLedger(e.target.value)}
+                            className="bg-transparent text-sm font-bold text-zinc-800 focus:outline-none border-b border-dashed border-zinc-400 pb-0.5 cursor-pointer mt-0.5"
+                          >
+                            <option value="">-- Select Bank/Cash Ledger --</option>
+                            {tallyContext.ledgers.map(l => (
+                              <option key={l} value={l}>{l}</option>
+                            ))}
+                          </select>
+                        ) : (
+                          <input
+                            type="text"
+                            value={selectedBankLedger}
+                            onChange={(e) => setSelectedBankLedger(e.target.value)}
+                            placeholder="Type Bank/Cash Ledger name"
+                            className="bg-transparent text-sm font-bold text-zinc-800 focus:outline-none border-b border-dashed border-zinc-400 pb-0.5 placeholder-zinc-400 w-64 mt-0.5"
+                          />
+                        )}
+                      </div>
+                    </div>
+                    
+                    <div className="flex flex-wrap items-center gap-4 text-xs font-medium text-zinc-600">
+                      <label className="flex items-center gap-2 cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={bankShowAttentionRequiredFirst}
+                          onChange={(e) => setBankShowAttentionRequiredFirst(e.target.checked)}
+                          className="rounded border-zinc-300 text-zinc-900 focus:ring-zinc-950 w-4 h-4 cursor-pointer"
+                        />
+                        Show attention required first
+                      </label>
+                      <label className="flex items-center gap-2 cursor-pointer select-none">
+                        <input
+                          type="checkbox"
+                          checked={bankCompactRowHeight}
+                          onChange={(e) => setBankCompactRowHeight(e.target.checked)}
+                          className="rounded border-zinc-300 text-zinc-900 focus:ring-zinc-950 w-4 h-4 cursor-pointer"
+                        />
+                        Compact Row Height
+                      </label>
+                    </div>
                   </div>
 
-                  {/* Bottom validation and actions block */}
-                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pt-4 border-t border-zinc-100">
-                    <div className="text-xs text-zinc-500 leading-relaxed max-w-xl">
-                      <span className="font-bold text-zinc-700">Rules applied:</span> Valid rows and non-excluded warnings will be written to the generated Tally XML. Invalid rows or manually excluded rows will be skipped. Ledger dropdown utilizes uploaded Tally masters context.
-                    </div>
-                    <div className="flex items-center gap-3 justify-end shrink-0">
-                      <button
-                        type="button"
-                        onClick={downloadReviewedTemplateExcel}
-                        className="px-5 py-3 bg-zinc-100 hover:bg-zinc-200 text-zinc-800 border border-zinc-200 rounded-xl text-xs font-bold transition-all flex items-center gap-2"
-                      >
-                        <Download className="w-4 h-4" />
-                        Download Reviewed Excel
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setBankStatementRows([]);
-                          setCurrentStep('upload');
-                        }}
-                        className="px-5 py-3 hover:bg-zinc-100 border border-zinc-200 text-zinc-700 rounded-xl text-xs font-bold transition-all flex items-center gap-2"
-                      >
-                        <RotateCcw className="w-4 h-4" />
-                        Cancel / Restart
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleBankStatementGenerateXML}
-                        disabled={isProcessing}
-                        className="px-6 py-3 bg-zinc-900 hover:bg-zinc-850 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-2 disabled:opacity-50 shadow-sm"
-                      >
-                        {isProcessing ? (
-                          <>
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                            Processing...
-                          </>
-                        ) : (
-                          <>
-                            <FileCode className="w-4 h-4" />
-                            Generate Tally XML
-                          </>
+                  {/* Search and Filters Toolbar */}
+                  <div className="space-y-3">
+                    <div className="flex flex-col md:flex-row gap-3">
+                      {/* Search Input */}
+                      <div className="relative flex-1">
+                        <Search className="absolute left-3 top-2.5 h-4 w-4 text-zinc-400" />
+                        <input
+                          type="text"
+                          placeholder="Search rows by date, narration, reference, ledger, voucher type, or amount..."
+                          value={bankSearchTerm}
+                          onChange={(e) => setBankSearchTerm(e.target.value)}
+                          className="w-full pl-10 pr-4 py-2 border border-zinc-200 rounded-xl text-xs outline-none focus:border-zinc-900 focus:ring-1 focus:ring-zinc-900"
+                        />
+                        {bankSearchTerm && (
+                          <button
+                            onClick={() => setBankSearchTerm('')}
+                            className="absolute right-3 top-2 text-zinc-400 hover:text-zinc-600 text-xs font-semibold"
+                          >
+                            Clear
+                          </button>
                         )}
-                      </button>
+                      </div>
+                    </div>
+
+                    {/* Filter Chips list */}
+                    {(() => {
+                      const totalCount = bankStatementRows.length;
+                      const validCount = bankStatementRows.filter(r => r.status === 'valid' && !r.excluded).length;
+                      const invalidCount = bankStatementRows.filter(r => r.status === 'invalid').length;
+                      const warningCount = bankStatementRows.filter(r => r.status === 'warning').length;
+                      const blankCount = bankStatementRows.filter(r => !r.userLedger || !r.userLedger.trim()).length;
+                      const suspenseCount = bankStatementRows.filter(r => r.userLedger && /suspense/i.test(r.userLedger)).length;
+                      const missingCount = tallyContext ? bankStatementRows.filter(r => r.userLedger && !tallyContext.ledgers.includes(r.userLedger)).length : 0;
+                      const lowConfCount = bankStatementRows.filter(r => r.confidence < 90).length;
+                      const paymentCount = bankStatementRows.filter(r => r.detectedVoucherType === 'Payment').length;
+                      const receiptCount = bankStatementRows.filter(r => r.detectedVoucherType === 'Receipt').length;
+
+                      const chips = [
+                        { label: 'All', value: 'All', count: totalCount },
+                        { label: 'Valid', value: 'Valid', count: validCount },
+                        { label: 'Invalid', value: 'Invalid', count: invalidCount },
+                        { label: 'Warnings', value: 'Warnings', count: warningCount },
+                        { label: 'Blank Ledger', value: 'Blank Ledger', count: blankCount },
+                        { label: 'Suspense Account', value: 'Suspense', count: suspenseCount },
+                        ...(tallyContext ? [{ label: 'Missing Master', value: 'Missing Master', count: missingCount }] : []),
+                        { label: 'Low Confidence (<90%)', value: 'Low Confidence', count: lowConfCount },
+                        { label: 'Payment (Dr)', value: 'Payment', count: paymentCount },
+                        { label: 'Receipt (Cr)', value: 'Receipt', count: receiptCount },
+                      ];
+
+                      return (
+                        <div className="flex flex-wrap gap-2 pt-1">
+                          {chips.map(chip => (
+                            <button
+                              key={chip.value}
+                              type="button"
+                              onClick={() => setBankFilterType(chip.value)}
+                              className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-all flex items-center gap-1.5 ${
+                                bankFilterType === chip.value
+                                  ? 'bg-zinc-950 text-white border-zinc-950'
+                                  : 'bg-zinc-50 text-zinc-600 border-zinc-200 hover:bg-zinc-100'
+                              }`}
+                            >
+                              <span>{chip.label}</span>
+                              <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${
+                                bankFilterType === chip.value ? 'bg-zinc-800 text-zinc-200' : 'bg-zinc-200 text-zinc-600'
+                              }`}>{chip.count}</span>
+                            </button>
+                          ))}
+                        </div>
+                      );
+                    })()}
+                  </div>
+
+                  {/* Master checklist warnings if not uploaded */}
+                  {!tallyContext && (
+                    <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl flex items-center gap-2 text-amber-800 text-xs">
+                      <AlertCircle className="w-4 h-4 shrink-0 text-amber-600" />
+                      <span><strong>Warning:</strong> Tally Masters context is not loaded. Missing masters cannot be verified before XML generation. Vouchers will map using standard typing.</span>
+                    </div>
+                  )}
+
+                  {/* Notifications */}
+                  {bankSuccessMessage && (
+                    <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl flex items-center gap-2 text-emerald-800 text-xs font-semibold animate-pulse">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                      <span>{bankSuccessMessage}</span>
+                    </div>
+                  )}
+
+                  {/* Full Ledger Grid Table */}
+                  <div className="border border-zinc-200 rounded-xl overflow-hidden bg-white shadow-sm max-h-[600px] overflow-y-auto">
+                    {(() => {
+                      // Compute matching rows
+                      let items = [...bankStatementRows];
+                      
+                      if (bankSearchTerm.trim()) {
+                        const term = bankSearchTerm.toLowerCase();
+                        items = items.filter(row => {
+                          const dateMatch = (row.date || '').toLowerCase().includes(term);
+                          const descMatch = (row.description || '').toLowerCase().includes(term);
+                          const refMatch = (row.reference || '').toLowerCase().includes(term);
+                          const suggMatch = (row.suggestedLedger || '').toLowerCase().includes(term);
+                          const finalMatch = (row.userLedger || '').toLowerCase().includes(term);
+                          const typeMatch = (row.detectedVoucherType || '').toLowerCase().includes(term);
+                          const amountMatch = (row.amount || 0).toString().includes(term);
+                          return dateMatch || descMatch || refMatch || suggMatch || finalMatch || typeMatch || amountMatch;
+                        });
+                      }
+
+                      if (bankFilterType !== 'All') {
+                        items = items.filter(row => {
+                          const isBlank = !row.userLedger || !row.userLedger.trim();
+                          const isSuspense = row.userLedger && /suspense/i.test(row.userLedger);
+                          const isMissingFromMaster = tallyContext && row.userLedger && !tallyContext.ledgers.includes(row.userLedger);
+                          const isLowConfidence = row.confidence < 90;
+                          
+                          switch (bankFilterType) {
+                            case 'Valid':
+                              return row.status === 'valid' && !row.excluded;
+                            case 'Invalid':
+                              return row.status === 'invalid';
+                            case 'Warnings':
+                              return row.status === 'warning';
+                            case 'Blank Ledger':
+                              return isBlank;
+                            case 'Suspense':
+                              return isSuspense;
+                            case 'Missing Master':
+                              return isMissingFromMaster;
+                            case 'Low Confidence':
+                              return isLowConfidence;
+                            case 'Payment':
+                              return row.detectedVoucherType === 'Payment';
+                            case 'Receipt':
+                              return row.detectedVoucherType === 'Receipt';
+                            default:
+                              return true;
+                          }
+                        });
+                      }
+
+                      if (bankShowAttentionRequiredFirst) {
+                        items.sort((a, b) => {
+                          const getPriority = (row: any) => {
+                            const isBlank = !row.userLedger || !row.userLedger.trim();
+                            const isSuspense = row.userLedger && /suspense/i.test(row.userLedger);
+                            const isMissingFromMaster = tallyContext && row.userLedger && !tallyContext.ledgers.includes(row.userLedger);
+                            const isLowConf = row.confidence < 90;
+                            const isIncluded = !row.excluded;
+
+                            if (row.status === 'invalid') return 1;
+                            if (isIncluded && isBlank) return 2;
+                            if (isIncluded && isSuspense) return 3;
+                            if (isIncluded && isMissingFromMaster) return 4;
+                            if (isIncluded && isLowConf) return 5;
+                            if (row.status === 'warning') return 6;
+                            return 7;
+                          };
+
+                          return getPriority(a) - getPriority(b);
+                        });
+                      }
+
+                      if (items.length === 0) {
+                        return (
+                          <div className="p-12 text-center text-zinc-400">
+                            No transactions match the selected search or filter options.
+                          </div>
+                        );
+                      }
+
+                      return (
+                        <table className="w-full text-[11px] text-left border-collapse table-fixed min-w-[1400px]">
+                          <thead className="bg-zinc-50 text-zinc-600 uppercase font-bold border-b border-zinc-200 sticky top-0 z-10">
+                            <tr>
+                              <th className="p-3 w-16 text-center">Include</th>
+                              <th className="p-3 w-14 text-center">Row</th>
+                              <th className="p-3 w-24">Date</th>
+                              <th className="p-3 w-40 text-center">Voucher Type</th>
+                              <th className="p-3 w-80">Narration / Description</th>
+                              <th className="p-3 w-28 text-right">Debit</th>
+                              <th className="p-3 w-28 text-right">Credit</th>
+                              <th className="p-3 w-28 text-right">Amount</th>
+                              <th className="p-3 w-28">Reference</th>
+                              <th className="p-3 w-40">Suggested Ledger</th>
+                              <th className="p-3 w-20 text-center">Conf %</th>
+                              <th className="p-3 w-56">Final Ledger Account</th>
+                              <th className="p-3 w-32">Master Status</th>
+                              <th className="p-3 w-48">Warning / Error</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-zinc-100">
+                            {items.map((row) => {
+                              const isInvalid = row.status === 'invalid';
+                              const isWarning = row.status === 'warning';
+                              const isExcluded = row.excluded;
+
+                              const isBlank = !row.userLedger || !row.userLedger.trim();
+                              const isSuspense = row.userLedger && /suspense/i.test(row.userLedger);
+                              const isMissingFromMaster = tallyContext && row.userLedger && !tallyContext.ledgers.includes(row.userLedger);
+                              const isManuallyChanged = row.userLedger !== row.suggestedLedger;
+                              const isValidMaster = tallyContext && row.userLedger && tallyContext.ledgers.includes(row.userLedger) && !isSuspense;
+
+                              const paddingClass = bankCompactRowHeight ? 'p-1.5' : 'p-3';
+
+                              return (
+                                <tr 
+                                  key={row.rowNo} 
+                                  className={`transition-colors ${
+                                    isExcluded 
+                                      ? 'bg-zinc-50/60 text-zinc-400' 
+                                      : isInvalid 
+                                        ? 'bg-rose-50/30' 
+                                        : isWarning || isBlank || isSuspense
+                                          ? 'bg-amber-50/20' 
+                                          : 'hover:bg-zinc-50/50'
+                                  }`}
+                                >
+                                  {/* Checkbox */}
+                                  <td className={`${paddingClass} text-center`}>
+                                    <input
+                                      type="checkbox"
+                                      checked={!row.excluded}
+                                      onChange={(e) => {
+                                        const updated = [...bankStatementRows];
+                                        const origIdx = bankStatementRows.findIndex(r => r.rowNo === row.rowNo);
+                                        if (origIdx !== -1) {
+                                          updated[origIdx].excluded = !e.target.checked;
+                                          setBankStatementRows(updated);
+                                        }
+                                      }}
+                                      className="rounded border-zinc-300 text-zinc-900 focus:ring-zinc-950 w-4 h-4 cursor-pointer"
+                                    />
+                                  </td>
+
+                                  {/* Row No */}
+                                  <td className={`${paddingClass} text-center font-mono font-medium`}>{row.rowNo}</td>
+
+                                  {/* Date */}
+                                  <td className={`${paddingClass} font-semibold whitespace-nowrap`}>{row.date}</td>
+
+                                  {/* Voucher Type Dropdown Toggle */}
+                                  <td className={`${paddingClass} text-center`}>
+                                    <select
+                                      value={row.detectedVoucherType}
+                                      onChange={(e) => {
+                                        const val = e.target.value as 'Payment' | 'Receipt' | 'Unknown';
+                                        const updated = [...bankStatementRows];
+                                        const origIdx = bankStatementRows.findIndex(r => r.rowNo === row.rowNo);
+                                        if (origIdx !== -1) {
+                                          updated[origIdx].detectedVoucherType = val;
+                                          setBankStatementRows(updated);
+                                        }
+                                      }}
+                                      disabled={row.excluded}
+                                      className="p-1.5 bg-white border border-zinc-200 rounded-lg text-xs font-bold outline-none focus:ring-1 focus:ring-zinc-950 disabled:opacity-50 text-center w-full shadow-xs cursor-pointer"
+                                    >
+                                      <option value="Payment">Payment</option>
+                                      <option value="Receipt">Receipt</option>
+                                      <option value="Unknown">Unknown</option>
+                                    </select>
+                                  </td>
+
+                                  {/* Narration */}
+                                  <td className={`${paddingClass} truncate font-medium`} title={row.description}>
+                                    {row.description}
+                                  </td>
+
+                                  {/* Debit */}
+                                  <td className={`${paddingClass} text-right font-mono font-medium text-rose-600`}>
+                                    {row.debit !== null && row.debit !== undefined ? row.debit.toLocaleString('en-IN', { minimumFractionDigits: 2 }) : '-'}
+                                  </td>
+
+                                  {/* Credit */}
+                                  <td className={`${paddingClass} text-right font-mono font-medium text-emerald-600`}>
+                                    {row.credit !== null && row.credit !== undefined ? row.credit.toLocaleString('en-IN', { minimumFractionDigits: 2 }) : '-'}
+                                  </td>
+
+                                  {/* Amount */}
+                                  <td className={`${paddingClass} text-right font-mono font-bold text-zinc-900`}>
+                                    {row.amount ? row.amount.toLocaleString('en-IN', { minimumFractionDigits: 2 }) : '0.00'}
+                                  </td>
+
+                                  {/* Reference */}
+                                  <td className={`${paddingClass}`}>
+                                    <input
+                                      type="text"
+                                      value={row.reference || ''}
+                                      onChange={(e) => {
+                                        const updated = [...bankStatementRows];
+                                        const origIdx = bankStatementRows.findIndex(r => r.rowNo === row.rowNo);
+                                        if (origIdx !== -1) {
+                                          updated[origIdx].reference = e.target.value;
+                                          setBankStatementRows(updated);
+                                        }
+                                      }}
+                                      disabled={isExcluded}
+                                      placeholder="No Ref"
+                                      className="w-full bg-zinc-50 border border-zinc-200 rounded px-2 py-1 text-xs text-zinc-800 focus:border-zinc-400 focus:outline-none font-mono"
+                                    />
+                                  </td>
+
+                                  {/* Suggested Ledger */}
+                                  <td className={`${paddingClass} font-medium text-zinc-700 truncate`} title={row.reasoning || row.suggestedLedger}>
+                                    {row.suggestedLedger || <span className="text-zinc-400 italic">No suggestion</span>}
+                                  </td>
+
+                                  {/* Confidence */}
+                                  <td className={`${paddingClass} text-center`}>
+                                    <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                                      row.confidence >= 90
+                                        ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                        : row.confidence >= 50
+                                          ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                                          : 'bg-zinc-100 text-zinc-600'
+                                    }`}>
+                                      {row.confidence ? `${row.confidence}%` : '0%'}
+                                    </span>
+                                  </td>
+
+                                  {/* Final Ledger Account Search/Editable Input */}
+                                  <td className={`${paddingClass}`}>
+                                    <input
+                                      type="text"
+                                      list="tally-ledgers-list"
+                                      value={row.userLedger || ''}
+                                      onChange={(e) => {
+                                        const val = e.target.value;
+                                        const updated = [...bankStatementRows];
+                                        const origIdx = bankStatementRows.findIndex(r => r.rowNo === row.rowNo);
+                                        if (origIdx !== -1) {
+                                          updated[origIdx].userLedger = val;
+                                          setBankStatementRows(updated);
+                                        }
+                                      }}
+                                      disabled={isExcluded}
+                                      placeholder="Type or select ledger"
+                                      className="w-full p-2 bg-white border border-zinc-200 rounded-lg text-xs outline-none focus:ring-1 focus:ring-zinc-950 disabled:opacity-50 font-semibold text-zinc-800"
+                                    />
+                                  </td>
+
+                                  {/* Master Status Badge */}
+                                  <td className={`${paddingClass}`}>
+                                    {isBlank && (
+                                      <span className="px-2 py-0.5 rounded bg-zinc-100 text-zinc-600 text-[9px] font-bold">Blank</span>
+                                    )}
+                                    {isSuspense && (
+                                      <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-800 text-[9px] font-bold">Suspense</span>
+                                    )}
+                                    {isMissingFromMaster && (
+                                      <span className="px-2 py-0.5 rounded bg-rose-100 text-rose-800 text-[9px] font-bold">Missing Master</span>
+                                    )}
+                                    {isManuallyChanged && !isMissingFromMaster && !isSuspense && !isBlank && (
+                                      <span className="px-2 py-0.5 rounded bg-blue-100 text-blue-800 text-[9px] font-bold" title={`Original suggested: ${row.suggestedLedger || 'none'}`}>Manual edit</span>
+                                    )}
+                                    {isValidMaster && !isManuallyChanged && (
+                                      <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 text-[9px] font-bold">Valid Master</span>
+                                    )}
+                                  </td>
+
+                                  {/* Error / Warning info */}
+                                  <td className={`${paddingClass} truncate text-[10px]`} title={row.errorMsg || row.reasoning}>
+                                    {isInvalid && (
+                                      <span className="text-rose-600 font-medium flex items-center gap-1">
+                                        <AlertCircle className="w-3 h-3 shrink-0" />
+                                        <span>{row.errorMsg || "Invalid State"}</span>
+                                      </span>
+                                    )}
+                                    {isBlank && (
+                                      <span className="text-rose-600 font-medium flex items-center gap-1">
+                                        <AlertCircle className="w-3 h-3 shrink-0" />
+                                        <span>Needs Review: Ledger empty</span>
+                                      </span>
+                                    )}
+                                    {isSuspense && (
+                                      <span className="text-amber-600 font-medium flex items-center gap-1">
+                                        <AlertCircle className="w-3 h-3 shrink-0" />
+                                        <span>Suspense selected</span>
+                                      </span>
+                                    )}
+                                    {isWarning && !isInvalid && !isBlank && !isSuspense && (
+                                      <span className="text-amber-600 font-medium flex items-center gap-1">
+                                        <AlertCircle className="w-3 h-3 shrink-0" />
+                                        <span>{row.errorMsg || "Review Warning"}</span>
+                                      </span>
+                                    )}
+                                    {!isInvalid && !isBlank && !isSuspense && !isWarning && (
+                                      <span className="text-emerald-600 font-semibold flex items-center gap-1">
+                                        <CheckCircle2 className="w-3 h-3 shrink-0" />
+                                        <span>Ready</span>
+                                      </span>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      );
+                    })()}
+                  </div>
+
+                  {/* Shared datalist for Tally Master ledgers list (loaded once for performance) */}
+                  <datalist id="tally-ledgers-list">
+                    {tallyContext?.ledgers.map(l => (
+                      <option key={l} value={l} />
+                    ))}
+                  </datalist>
+
+                  {/* Row-wise Error and Validation summary panel */}
+                  {bankStatementValidationErrors.length > 0 && (
+                    <div className="p-4 bg-rose-50 border border-rose-200 rounded-xl space-y-3">
+                      <div className="flex items-center gap-2 text-rose-800 font-bold text-sm">
+                        <AlertCircle className="w-4 h-4 shrink-0 text-rose-600" />
+                        <span>XML Export Blocked: {bankStatementValidationErrors.length} Issue(s) Need Attention</span>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left border-collapse text-xs">
+                          <thead>
+                            <tr className="border-b border-rose-200 text-rose-800 font-bold">
+                              <th className="pb-2 w-20 text-center">Row No</th>
+                              <th className="pb-2 w-1/3">Issue / Validation Failure</th>
+                              <th className="pb-2">Suggested Resolution / Fix</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-rose-100 text-rose-700">
+                            {bankStatementValidationErrors.map((err, i) => (
+                              <tr key={i}>
+                                <td className="py-2 text-center font-mono font-bold">{err.rowNo === 0 ? "General" : `#${err.rowNo}`}</td>
+                                <td className="py-2 font-medium">{err.issue}</td>
+                                <td className="py-2 text-zinc-600 font-medium">{err.suggestedFix}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Bottom Panel Controls (Suspense conformation & actions) */}
+                  <div className="pt-4 border-t border-zinc-100 flex flex-col gap-4">
+                    {/* Suspense Confirmation Checkbox */}
+                    <div className="bg-zinc-50 border border-zinc-200/60 p-3 rounded-xl flex items-center justify-between gap-4">
+                      <div className="text-xs text-zinc-600 font-medium">
+                        <span className="font-bold text-zinc-800">Suspense Fallback Confirmation:</span> If you are intentionally parking transactions in Suspense / Suspense Account, check the confirmation to allow exporting those rows.
+                      </div>
+                      <label className="flex items-center gap-2 cursor-pointer select-none font-bold text-xs text-zinc-900 bg-white border border-zinc-200 rounded-lg px-3 py-1.5 shadow-xs shrink-0 shrink-0">
+                        <input
+                          type="checkbox"
+                          checked={confirmProceedWithSuspense}
+                          onChange={(e) => {
+                            setConfirmProceedWithSuspense(e.target.checked);
+                            // Auto reset errors list if checked
+                            if (e.target.checked) {
+                              setBankStatementValidationErrors(prev => prev.filter(err => !/suspense/i.test(err.issue)));
+                            }
+                          }}
+                          className="rounded border-zinc-300 text-zinc-900 focus:ring-zinc-950 w-4 h-4 cursor-pointer"
+                        />
+                        Proceed with Suspense
+                      </label>
+                    </div>
+
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                      <div className="text-xs text-zinc-400 font-medium leading-relaxed max-w-xl">
+                        Valid, non-excluded rows will be converted. standard Tally XML format will preserve the Excel narration and append reference codes.
+                      </div>
+                      
+                      <div className="flex flex-wrap items-center gap-3 justify-end shrink-0">
+                        {/* Cancel / Restart */}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setBankStatementRows([]);
+                            setRawGrid([]);
+                            setCurrentStep('upload');
+                          }}
+                          className="px-4 py-2.5 hover:bg-zinc-100 border border-zinc-200 text-zinc-700 rounded-xl text-xs font-semibold transition-all flex items-center gap-1.5"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                          Restart over
+                        </button>
+
+                        {/* Back to Mapping */}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setCurrentStep('mapping');
+                          }}
+                          className="px-4 py-2.5 hover:bg-zinc-100 border border-zinc-200 text-zinc-700 rounded-xl text-xs font-semibold transition-all flex items-center gap-1.5"
+                        >
+                          <ArrowLeft className="w-3.5 h-3.5" />
+                          Back to Mapping
+                        </button>
+
+                        {/* Download Reviewed Excel */}
+                        <button
+                          type="button"
+                          onClick={downloadReviewedTemplateExcel}
+                          className="px-4 py-2.5 bg-zinc-100 hover:bg-zinc-200 border border-zinc-200 text-zinc-800 rounded-xl text-xs font-semibold transition-all flex items-center gap-1.5 shadow-xs"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          Download Reviewed Excel
+                        </button>
+
+                        {/* Generate XML */}
+                        <button
+                          type="button"
+                          onClick={handleBankStatementGenerateXML}
+                          disabled={isProcessing}
+                          className="px-5 py-2.5 bg-zinc-950 hover:bg-zinc-850 disabled:bg-zinc-300 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-50 shadow-sm"
+                        >
+                          {isProcessing ? (
+                            <>
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              Generating...
+                            </>
+                          ) : (
+                            <>
+                              <FileCode className="w-3.5 h-3.5" />
+                              Generate Tally XML
+                            </>
+                          )}
+                        </button>
+                      </div>
                     </div>
                   </div>
                 </motion.section>
@@ -7731,6 +8282,26 @@ export default function App() {
                     </div>
                   </div>
 
+                  {/* Narration Settings Toggle */}
+                  <div className="bg-zinc-50 border border-zinc-200 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                    <div className="space-y-1">
+                      <h4 className="text-sm font-bold text-zinc-900">Default Blank Narration Fallback</h4>
+                      <p className="text-xs text-zinc-500">
+                        When the Excel Narration column is empty, should the system fallback to the selected Ledger Name?
+                      </p>
+                    </div>
+                    <label className="relative inline-flex items-center cursor-pointer select-none">
+                      <input 
+                        type="checkbox" 
+                        checked={useLedgerAsNarration} 
+                        onChange={(e) => setUseLedgerAsNarration(e.target.checked)}
+                        className="sr-only peer" 
+                      />
+                      <div className="w-11 h-6 bg-zinc-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-zinc-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-zinc-850"></div>
+                      <span className="ml-3 text-xs font-bold text-zinc-700">Use ledger as narration</span>
+                    </label>
+                  </div>
+
                   {/* Table Container */}
                   <div className="border border-zinc-200 rounded-xl overflow-hidden bg-white">
                     <div className="max-h-[500px] overflow-y-auto">
@@ -7739,9 +8310,11 @@ export default function App() {
                           <tr className="bg-zinc-50 border-b border-zinc-200 font-bold text-zinc-700">
                             <th className="p-3 w-16 text-center">Row</th>
                             <th className="p-3 w-28">Voucher Type</th>
-                            <th className="p-3 w-40">Date (Original → Tally)</th>
-                            <th className="p-3">Ledger Entries & Sign Logic Preview</th>
-                            <th className="p-3 w-48">Reference / Narration</th>
+                            <th className="p-3 w-40">Date</th>
+                            <th className="p-3">Ledger / Particulars</th>
+                            <th className="p-3 w-48">Narration</th>
+                            <th className="p-3 w-36">Reference</th>
+                            <th className="p-3 w-64">Final XML Narration Preview</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-zinc-100">
@@ -7867,14 +8440,34 @@ export default function App() {
                                     </span>
                                   </div>
                                 </td>
-                                <td className="p-3 space-y-1">
-                                  {row.reference && (
-                                    <div className="font-medium text-zinc-900 flex items-center gap-1">
-                                      <span className="text-[9px] font-bold bg-zinc-100 text-zinc-600 px-1 py-0.2 rounded uppercase">Ref</span>
-                                      <span className="truncate max-w-[150px] font-mono">{row.reference}</span>
-                                    </div>
-                                  )}
-                                  <div className="text-zinc-500 text-[11px] leading-relaxed line-clamp-2">{row.description}</div>
+                                <td className="p-3">
+                                  <input
+                                    type="text"
+                                    value={row.description && row.description !== 'No Narration Found' ? row.description : ''}
+                                    onChange={(e) => {
+                                      const updated = [...verificationRows];
+                                      updated[idx].description = e.target.value;
+                                      setVerificationRows(updated);
+                                    }}
+                                    placeholder="No Narration"
+                                    className="w-full bg-transparent border border-zinc-200 rounded px-2 py-1 text-xs text-zinc-800 focus:border-zinc-400 focus:outline-none"
+                                  />
+                                </td>
+                                <td className="p-3">
+                                  <input
+                                    type="text"
+                                    value={row.reference || ''}
+                                    onChange={(e) => {
+                                      const updated = [...verificationRows];
+                                      updated[idx].reference = e.target.value;
+                                      setVerificationRows(updated);
+                                    }}
+                                    placeholder="No Ref"
+                                    className="w-full bg-transparent border border-zinc-200 rounded px-2 py-1 text-xs text-zinc-800 focus:border-zinc-400 focus:outline-none font-mono"
+                                  />
+                                </td>
+                                <td className="p-3 font-mono text-[11px] text-zinc-600 bg-zinc-50/30 truncate max-w-[200px]" title={getFinalXMLNarration(row, useLedgerAsNarration)}>
+                                  &lt;NARRATION&gt;{getFinalXMLNarration(row, useLedgerAsNarration)}&lt;/NARRATION&gt;
                                 </td>
                               </tr>
                             );
@@ -9128,7 +9721,7 @@ export default function App() {
                               </span>
                               <button
                                 type="button"
-                                disabled={isProcessing || journalGroups.some(g => !g.isValid)}
+                                disabled={isProcessing || !journalGroups.some(g => g.isValid)}
                                 onClick={() => checkMissingMastersAndProceedJournal(journalGroups)}
                                 className="px-6 py-2.5 bg-zinc-950 hover:bg-zinc-800 disabled:opacity-40 text-white rounded-xl text-xs font-bold transition-all shadow-sm flex items-center gap-1.5"
                               >

@@ -206,7 +206,28 @@ export interface TallyUnitMaster {
   decimalPlaces?: string;
 }
 
-export function generateTallyXML(vouchers: TallyVoucher[]): string {
+export function getFinalXMLNarration(row: any, useLedgerAsNarr: boolean): string {
+  const narrationVal = row.narration !== undefined ? row.narration : row.description;
+  let actualNarration = narrationVal && narrationVal.trim() && narrationVal.trim() !== 'No Narration Found' ? narrationVal.trim() : '';
+  
+  if (!actualNarration && useLedgerAsNarr) {
+    const ledgerVal = row.finalLedger || row.userLedger;
+    if (ledgerVal && ledgerVal.trim()) {
+      actualNarration = ledgerVal.trim();
+    }
+  }
+  
+  let finalNarration = actualNarration;
+  if (row.reference && row.reference.trim()) {
+    const refTrimmed = row.reference.trim();
+    finalNarration = finalNarration
+      ? `${finalNarration} | Ref: ${refTrimmed}`
+      : `Ref: ${refTrimmed}`;
+  }
+  return finalNarration;
+}
+
+export function generateTallyXML(vouchers: TallyVoucher[], useLedgerAsNarr: boolean = false): string {
   const builder = new XMLBuilder({
     ignoreAttributes: false,
     format: true,
@@ -228,8 +249,16 @@ export function generateTallyXML(vouchers: TallyVoucher[]): string {
               // 1. Get reference if available
               const refVal = v.reference ? v.reference.trim() : '';
               
-              // 2. Prepare narration and append reference if it doesn't already exist in narration
-              let finalNarration = v.narration ? v.narration.trim() : '';
+              // 2. Prepare narration and append reference
+              let rawNarration = v.narration ? v.narration.trim() : '';
+              if (rawNarration === 'No Narration Found') {
+                rawNarration = '';
+              }
+              let finalNarration = rawNarration;
+              if (!finalNarration && useLedgerAsNarr) {
+                finalNarration = v.partyName ? v.partyName.trim() : '';
+              }
+
               if (refVal) {
                 const refSnippet = `Ref: ${refVal}`;
                 if (finalNarration) {
