@@ -30,8 +30,20 @@ import {
   deleteTallyContext, 
   saveConversion, 
   updateConversion, 
-  clearOfflineWorkspace 
+  clearOfflineWorkspace,
+  saveTallyPushLog,
+  getTallyPushLogs,
+  TallyPushLog
 } from './lib/storageAdapter';
+import { 
+  isDirectTallyAvailable, 
+  testTallyConnection, 
+  fetchTallyCompany, 
+  fetchTallyMasters, 
+  fetchTallyDaybook, 
+  pushXmlToTally, 
+  parseTallyResponse 
+} from './lib/tallyConnector';
 import { 
   FileSpreadsheet, 
   LogOut, 
@@ -53,7 +65,10 @@ import {
   Upload,
   HelpCircle,
   Building,
-  Trash2
+  Trash2,
+  RefreshCw,
+  X,
+  Check
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import * as XLSX from 'xlsx';
@@ -617,6 +632,447 @@ export default function App() {
   const [bankCompactRowHeight, setBankCompactRowHeight] = useState(false);
   const [bankStatementValidationErrors, setBankStatementValidationErrors] = useState<{ rowNo: number; issue: string; suggestedFix: string }[]>([]);
   const [bankSuccessMessage, setBankSuccessMessage] = useState<string | null>(null);
+
+  // Direct Tally Connection states
+  const [tallyHost, setTallyHost] = useState('localhost');
+  const [tallyPort, setTallyPort] = useState(9000);
+  const [tallyStatus, setTallyStatus] = useState<'Disconnected' | 'Connecting' | 'Connected' | 'Error'>('Disconnected');
+  const [tallyError, setTallyError] = useState('');
+  const [tallyCompany, setTallyCompany] = useState('');
+  const [tallyFromDate, setTallyFromDate] = useState('2026-04-01');
+  const [tallyToDate, setTallyToDate] = useState('2026-07-19');
+  const [recentPushLogs, setRecentPushLogs] = useState<TallyPushLog[]>([]);
+  const [isPushModalOpen, setIsPushModalOpen] = useState(false);
+  const [pushModalData, setPushModalData] = useState<{
+    companyName: string;
+    xmlType: string;
+    voucherCount: number;
+    masterCount: number;
+    xmlContent: string;
+    onSuccess?: () => void;
+  } | null>(null);
+  const [isPushing, setIsPushing] = useState(false);
+
+  // Load push logs on mount
+  useEffect(() => {
+    getTallyPushLogs()
+      .then(logs => setRecentPushLogs(logs))
+      .catch(err => console.error("Error loading push logs:", err));
+  }, []);
+
+  const refreshPushLogs = async () => {
+    try {
+      const logs = await getTallyPushLogs();
+      setRecentPushLogs(logs);
+    } catch (err) {
+      console.error("Error refreshing push logs:", err);
+    }
+  };
+
+  const handleTestConnection = async () => {
+    setTallyStatus('Connecting');
+    setTallyError('');
+    setTallyCompany('');
+    try {
+      const config = { host: tallyHost, port: tallyPort };
+      const res = await testTallyConnection(config);
+      if (res.success) {
+        setTallyStatus('Connected');
+        const summary = parseTallyResponse(res.response || '');
+        if (summary.companyName) {
+          setTallyCompany(summary.companyName);
+        } else {
+          const compRes = await fetchTallyCompany(config);
+          if (compRes.success) {
+            const compSummary = parseTallyResponse(compRes.response || '');
+            if (compSummary.companyName) {
+              setTallyCompany(compSummary.companyName);
+            } else {
+              setTallyCompany('Active Company Detected');
+            }
+          } else {
+            setTallyCompany('Active Company Detected');
+          }
+        }
+      } else {
+        setTallyStatus('Error');
+        setTallyError(res.error || 'Connection failed. Please verify host, port, and ensure TallyPrime is open.');
+      }
+    } catch (err: any) {
+      setTallyStatus('Error');
+      setTallyError(err.message || 'Connection failed.');
+    }
+  };
+
+  const handleDisconnect = () => {
+    setTallyStatus('Disconnected');
+    setTallyError('');
+    setTallyCompany('');
+  };
+
+  const handleFetchMasters = async () => {
+    if (tallyStatus !== 'Connected') {
+      setError('Please connect to Tally first.');
+      return;
+    }
+    if (!user) return;
+    setIsContextLoading(true);
+    setError(null);
+    try {
+      const config = { host: tallyHost, port: tallyPort };
+      const parsed = await fetchTallyMasters(config);
+      
+      const existingMappings = tallyContext?.historicalMappings || [];
+      const contextPayload: any = {
+        uid: user.uid,
+        ledgers: Array.from(new Set(parsed.ledgers)),
+        groups: Array.from(new Set(parsed.groups)),
+        stockGroups: Array.from(new Set(parsed.stockGroups)),
+        stockItems: Array.from(new Set(parsed.stockItems)),
+        units: Array.from(new Set(parsed.units)),
+        ledgerGroupMap: parsed.ledgerGroupMap,
+        stockItemStockGroupMap: parsed.stockItemStockGroupMap,
+        groupParentMap: parsed.groupParentMap || {},
+        historicalMappings: existingMappings,
+        ledgerDetails: parsed.ledgerDetails || [],
+        stockItemDetails: parsed.stockItemDetails || [],
+      };
+      
+      if (getAppMode() === 'web') {
+        contextPayload.lastUpdated = serverTimestamp();
+      }
+      await saveTallyContext(user.uid, contextPayload);
+      setIsContextLoading(false);
+    } catch (err: any) {
+      console.error("Failed to fetch Tally masters", err);
+      setError(err.message || "Failed to fetch masters from local Tally.");
+      setIsContextLoading(false);
+    }
+  };
+
+  const handleFetchDaybook = async () => {
+    if (tallyStatus !== 'Connected') {
+      setError('Please connect to Tally first.');
+      return;
+    }
+    if (!user) return;
+    setIsContextLoading(true);
+    setError(null);
+    try {
+      const config = { host: tallyHost, port: tallyPort };
+      const txs = await fetchTallyDaybook(config, tallyFromDate, tallyToDate);
+      
+      const ledgerNamesFromEntries: string[] = [];
+      const historicalMappings: { narration: string; ledger: string }[] = [];
+
+      txs.forEach((tx) => {
+        if (tx.ledger) {
+          ledgerNamesFromEntries.push(tx.ledger);
+        }
+        if (tx.narration && tx.ledger) {
+          const lLower = tx.ledger.toLowerCase();
+          if (!lLower.includes('bank') && !lLower.includes('cash')) {
+            historicalMappings.push({ narration: tx.narration, ledger: tx.ledger });
+          }
+        }
+      });
+
+      const currentLedgers = tallyContext?.ledgers || [];
+      const mergedLedgers = Array.from(new Set([...currentLedgers, ...ledgerNamesFromEntries]));
+
+      const currentGroups = tallyContext?.groups || [];
+      const currentStockGroups = tallyContext?.stockGroups || [];
+      const currentStockItems = tallyContext?.stockItems || [];
+      const currentUnits = tallyContext?.units || [];
+      const currentLedgerGroupMap = tallyContext?.ledgerGroupMap || {};
+      const currentStockItemStockGroupMap = tallyContext?.stockItemStockGroupMap || {};
+      const currentGroupParentMap = tallyContext?.groupParentMap || {};
+      const currentHistorical = tallyContext?.historicalMappings || [];
+      
+      const mergedHistorical = [...currentHistorical, ...historicalMappings].slice(0, 500);
+
+      const contextPayload: any = {
+        uid: user.uid,
+        ledgers: mergedLedgers,
+        groups: currentGroups,
+        stockGroups: currentStockGroups,
+        stockItems: currentStockItems,
+        units: currentUnits,
+        ledgerGroupMap: currentLedgerGroupMap,
+        stockItemStockGroupMap: currentStockItemStockGroupMap,
+        groupParentMap: currentGroupParentMap,
+        historicalMappings: mergedHistorical,
+        ledgerDetails: tallyContext?.ledgerDetails || [],
+        stockItemDetails: tallyContext?.stockItemDetails || [],
+      };
+      
+      if (getAppMode() === 'web') {
+        contextPayload.lastUpdated = serverTimestamp();
+      }
+      await saveTallyContext(user.uid, contextPayload);
+      setIsContextLoading(false);
+    } catch (err: any) {
+      console.error("Failed to fetch Tally Daybook", err);
+      setError(err.message || "Failed to fetch Daybook transactions from local Tally.");
+      setIsContextLoading(false);
+    }
+  };
+
+  const initiateTallyPush = (
+    xmlContent: string,
+    xmlType: string,
+    voucherCount: number,
+    masterCount: number,
+    onSuccess?: () => void
+  ) => {
+    if (!isDirectTallyAvailable() || tallyStatus !== 'Connected') {
+      alert('Direct Tally push is only available when Connected to local Tally Prime.');
+      return;
+    }
+    setPushModalData({
+      companyName: tallyCompany || 'Active Tally Company',
+      xmlType,
+      voucherCount,
+      masterCount,
+      xmlContent,
+      onSuccess
+    });
+    setIsPushModalOpen(true);
+  };
+
+  const handleDirectPushToTally = async () => {
+    if (!pushModalData) return;
+    setIsPushing(true);
+    try {
+      const config = { host: tallyHost, port: tallyPort };
+      const res = await pushXmlToTally(config, pushModalData.xmlContent);
+      
+      let status: 'success' | 'failed' = 'failed';
+      let tallyResponse = '';
+      let errorMessage = '';
+      let created = 0;
+      let altered = 0;
+      let errorCount = 0;
+      
+      if (res.success && res.response) {
+        tallyResponse = res.response;
+        const parsed = parseTallyResponse(res.response);
+        created = parsed.createdCount || 0;
+        altered = parsed.alteredCount || 0;
+        errorCount = parsed.errorCount || 0;
+        
+        if (errorCount === 0 && (created > 0 || altered > 0 || parsed.success)) {
+          status = 'success';
+        } else {
+          status = 'failed';
+          errorMessage = parsed.errors?.join('\n') || 'Tally returned import errors.';
+        }
+      } else {
+        errorMessage = res.error || 'Failed to communicate with Tally.';
+      }
+      
+      await saveTallyPushLog({
+        companyName: pushModalData.companyName,
+        host: tallyHost,
+        port: tallyPort,
+        xmlType: pushModalData.xmlType,
+        voucherCount: pushModalData.voucherCount,
+        masterCount: pushModalData.masterCount,
+        status,
+        tallyResponse,
+        errorMessage
+      });
+      
+      await refreshPushLogs();
+      
+      setIsPushing(false);
+      setIsPushModalOpen(false);
+      
+      if (status === 'success') {
+        alert(`Successfully imported into Tally!\nCreated: ${created}\nAltered: ${altered}`);
+        if (pushModalData.onSuccess) {
+          pushModalData.onSuccess();
+        }
+      } else {
+        alert(`Failed to import into Tally.\nError Count: ${errorCount}\nDetails:\n${errorMessage}`);
+      }
+    } catch (err: any) {
+      console.error("Direct push error:", err);
+      setIsPushing(false);
+      alert("Error pushing to Tally: " + (err.message || String(err)));
+    }
+  };
+
+  const handlePushCombinedXmlOnTheFly = async () => {
+    const validationErrors = validateReview();
+    if (validationErrors.length > 0) {
+      alert('Please fix validation errors first:\n' + validationErrors.join('\n'));
+      return;
+    }
+    
+    setIsProcessing(true);
+    try {
+      let xml = '';
+      let voucherCount = 0;
+      let masterCount = missingLedgers.filter(m => m.action === 'Create').length + missingStockItems.filter(m => m.action === 'Create').length;
+      
+      if (pendingExportType === 'Vouchers') {
+        const finalVouchers = getReviewedVouchers();
+        voucherCount = finalVouchers.length;
+        const vouchers: TallyVoucher[] = finalVouchers.map(row => {
+          const vType = row.voucherType;
+          const amt = Math.abs(row.amount);
+          const voucher: TallyVoucher = {
+            date: row.normalizedDate,
+            voucherType: vType,
+            partyName: row.finalLedger,
+            bankLedger: row.bankLedger,
+            voucherNumber: row.voucherNumber || undefined,
+            narration: row.description || undefined,
+            reference: row.reference || undefined,
+            ledgerEntries: []
+          };
+          if (vType === 'Receipt') {
+            voucher.ledgerEntries.push({
+              ledgerName: row.finalLedger,
+              isDeemedPositive: 'No',
+              isLastDeemedPositive: 'No',
+              isPartyLedger: 'No',
+              amount: amt
+            });
+            voucher.ledgerEntries.push({
+              ledgerName: row.bankLedger || selectedBankLedger || 'Bank Account',
+              isDeemedPositive: 'Yes',
+              isLastDeemedPositive: 'Yes',
+              isPartyLedger: 'Yes',
+              amount: -amt
+            });
+          } else {
+            voucher.ledgerEntries.push({
+              ledgerName: row.finalLedger,
+              isDeemedPositive: 'Yes',
+              isLastDeemedPositive: 'Yes',
+              isPartyLedger: 'No',
+              amount: -amt
+            });
+            voucher.ledgerEntries.push({
+              ledgerName: row.bankLedger || selectedBankLedger || 'Bank Account',
+              isDeemedPositive: 'No',
+              isLastDeemedPositive: 'No',
+              isPartyLedger: 'Yes',
+              amount: amt
+            });
+          }
+          return voucher;
+        });
+        
+        xml = generateTallyXML(vouchers, useLedgerAsNarration);
+        xml = generateCombinedImportXML({
+          voucherXml: xml,
+          ...buildMissingMastersXMLs()
+        });
+      } else if (pendingExportType === 'Journal') {
+        const nameMap: Record<string, string> = {};
+        missingLedgers.forEach(ml => {
+          const key = ml.name.toLowerCase();
+          if (ml.action === 'Replace' && ml.replacementName) {
+            nameMap[key] = ml.replacementName;
+          } else if (ml.action === 'Create' && ml.name) {
+            nameMap[key] = ml.name;
+          }
+        });
+        const updatedGroups = journalGroups.map(g => {
+          const updatedLines = g.lines.map(l => {
+            const lKey = l.ledgerName.toLowerCase();
+            if (nameMap[lKey]) {
+              return { ...l, ledgerName: nameMap[lKey] };
+            }
+            return l;
+          });
+          return { ...g, lines: updatedLines };
+        });
+        voucherCount = updatedGroups.length;
+        xml = generateJournalXML(updatedGroups, true);
+      } else {
+        const finalInvoices = getReviewedInvoices();
+        voucherCount = finalInvoices.length;
+        const ledgerNameMap: Record<string, string> = {};
+        missingLedgers.forEach(ml => {
+          if (ml.action === 'Replace' && ml.replacementName) {
+            ledgerNameMap[ml.name.toLowerCase()] = ml.replacementName;
+          } else if (ml.action === 'Create' && ml.name) {
+            ledgerNameMap[ml.name.toLowerCase()] = ml.name;
+          }
+        });
+        const stockItemNameMap: Record<string, string> = {};
+        missingStockItems.forEach(ms => {
+          if (ms.action === 'Replace' && ms.replacementName) {
+            stockItemNameMap[ms.name.toLowerCase()] = ms.replacementName;
+          } else if (ms.action === 'Create' && ms.name) {
+            stockItemNameMap[ms.name.toLowerCase()] = ms.name;
+          }
+        });
+
+        const mappedInvoices = finalInvoices.map(inv => {
+          const updated = { ...inv };
+          const partyKey = updated.partyName.toLowerCase();
+          if (ledgerNameMap[partyKey]) {
+            updated.partyName = ledgerNameMap[partyKey];
+          }
+          if (updated.ledgerEntries) {
+            updated.ledgerEntries = updated.ledgerEntries.map(ent => {
+              const entKey = ent.ledgerName.toLowerCase();
+              if (ledgerNameMap[entKey]) {
+                return { ...ent, ledgerName: ledgerNameMap[entKey] };
+              }
+              return ent;
+            });
+          }
+          if (updated.inventoryEntries) {
+            updated.inventoryEntries = updated.inventoryEntries.map(ent => {
+              const entKey = ent.stockItemName.toLowerCase();
+              const updatedItem = { ...ent };
+              if (stockItemNameMap[entKey]) {
+                updatedItem.stockItemName = stockItemNameMap[entKey];
+              }
+              if (updatedItem.ledgerEntries) {
+                updatedItem.ledgerEntries = updatedItem.ledgerEntries.map(l => {
+                  const lKey = l.ledgerName.toLowerCase();
+                  if (ledgerNameMap[lKey]) {
+                    return { ...l, ledgerName: ledgerNameMap[lKey] };
+                  }
+                  return l;
+                });
+              }
+              return updatedItem;
+            });
+          }
+          return updated;
+        });
+
+        xml = generateSalesPurchaseXML(mappedInvoices, companyState);
+        xml = generateCombinedImportXML({
+          voucherXml: xml,
+          ...buildMissingMastersXMLs()
+        });
+      }
+
+      setIsProcessing(false);
+      initiateTallyPush(
+        xml,
+        'Combined Masters + Vouchers',
+        voucherCount,
+        masterCount,
+        () => {
+          setCurrentStep('complete');
+        }
+      );
+    } catch (err: any) {
+      console.error("Failed to generate combined XML for direct push", err);
+      alert("Failed to generate combined XML for direct push: " + err.message);
+      setIsProcessing(false);
+    }
+  };
 
   const updateVerificationRowLedger = (idx: number, ledgerName: string) => {
     // 1. Update verificationRows state
@@ -5749,6 +6205,18 @@ export default function App() {
                   <CheckCircle2 className="w-4 h-4" />
                   Download Combined XML
                 </button>
+
+                {getAppMode() === 'desktop-offline' && isDirectTallyAvailable() && tallyStatus === 'Connected' && (
+                  <button
+                    type="button"
+                    onClick={handlePushCombinedXmlOnTheFly}
+                    disabled={validateReview().length > 0}
+                    className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white text-xs font-semibold rounded-xl shadow-sm transition-all flex items-center gap-2"
+                  >
+                    <RefreshCw className="w-4 h-4" />
+                    Push Directly to Tally
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={async () => {
@@ -5945,6 +6413,227 @@ export default function App() {
                             </label>
                           </div>
                         </div>
+
+                        {/* Option 4: Direct Tally Connection (Offline only / disabled on Web) */}
+                        <div className="md:col-span-2 relative bg-zinc-50 border border-zinc-200 rounded-2xl p-6" id="setup-opt-direct-tally">
+                          <div className="flex flex-col md:flex-row md:items-start justify-between gap-6">
+                            <div className="flex-1 space-y-4">
+                              <div className="flex items-center gap-3">
+                                <div className="w-10 h-10 bg-emerald-50 border border-emerald-100 rounded-xl flex items-center justify-center text-emerald-600">
+                                  <RefreshCw className="w-5 h-5 animate-spin-slow" />
+                                </div>
+                                <div>
+                                  <h3 className="font-bold text-zinc-950 text-base flex items-center gap-2">
+                                    Direct Tally Connection
+                                    {getAppMode() === 'desktop-offline' && (
+                                      <span className="text-[10px] bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full font-bold uppercase">
+                                        Offline Only
+                                      </span>
+                                    )}
+                                  </h3>
+                                  <p className="text-zinc-500 text-xs mt-0.5">
+                                    Connect directly to TallyPrime to import masters and push transactions in one click.
+                                  </p>
+                                </div>
+                              </div>
+
+                              {getAppMode() !== 'desktop-offline' ? (
+                                <div className="bg-amber-50 border border-amber-200/60 rounded-xl p-4 text-amber-800 text-xs flex items-start gap-2.5">
+                                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                                  <div>
+                                    <p className="font-bold">Direct Tally connection is available only in Desktop Offline App.</p>
+                                    <p className="mt-1 text-amber-700/90">Please download TallyGen Pro Desktop Offline client or run Electron version to enable direct connection.</p>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="space-y-4">
+                                  {/* Inputs */}
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                    <div>
+                                      <label className="block text-[10px] font-bold text-zinc-600 uppercase tracking-wider mb-1.5">Tally Host / IP</label>
+                                      <input 
+                                        type="text" 
+                                        value={tallyHost} 
+                                        onChange={(e) => setTallyHost(e.target.value)}
+                                        disabled={tallyStatus === 'Connected' || tallyStatus === 'Connecting'}
+                                        placeholder="localhost" 
+                                        className="w-full bg-white border border-zinc-200 rounded-xl px-3 py-2 text-sm text-zinc-900 focus:outline-none focus:ring-2 focus:ring-emerald-500 disabled:bg-zinc-100 disabled:text-zinc-500"
+                                      />
+                                    </div>
+                                    <div>
+                                      <label className="block text-[10px] font-bold text-zinc-600 uppercase tracking-wider mb-1.5">Tally Port</label>
+                                      <input 
+                                        type="number" 
+                                        value={tallyPort} 
+                                        onChange={(e) => setTallyPort(Number(e.target.value))}
+                                        disabled={tallyStatus === 'Connected' || tallyStatus === 'Connecting'}
+                                        placeholder="9000" 
+                                        className="w-full bg-white border border-zinc-200 rounded-xl px-3 py-2 text-sm text-zinc-900 focus:outline-none focus:ring-2 focus:ring-emerald-500 disabled:bg-zinc-100 disabled:text-zinc-500"
+                                      />
+                                    </div>
+                                  </div>
+
+                                  {/* Connection Status Indicator */}
+                                  <div className="flex flex-wrap items-center gap-4 py-2 border-t border-b border-zinc-200/60">
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-xs font-semibold text-zinc-500">Status:</span>
+                                      <span className={`inline-flex items-center gap-1.5 text-xs font-bold px-2.5 py-1 rounded-full ${
+                                        tallyStatus === 'Connected' ? 'bg-emerald-100 text-emerald-800' :
+                                        tallyStatus === 'Connecting' ? 'bg-blue-100 text-blue-800' :
+                                        tallyStatus === 'Error' ? 'bg-rose-100 text-rose-800' :
+                                        'bg-zinc-200 text-zinc-700'
+                                      }`}>
+                                        {tallyStatus === 'Connecting' && <Loader2 className="w-3 h-3 animate-spin" />}
+                                        {tallyStatus}
+                                      </span>
+                                    </div>
+
+                                    {tallyCompany && (
+                                      <div className="flex items-center gap-2 text-xs">
+                                        <Building className="w-3.5 h-3.5 text-zinc-400" />
+                                        <span className="font-semibold text-zinc-600">Company:</span>
+                                        <span className="font-bold text-emerald-700">{tallyCompany}</span>
+                                      </div>
+                                    )}
+
+                                    {tallyError && (
+                                      <div className="text-xs font-medium text-rose-600 w-full flex items-start gap-1 mt-1">
+                                        <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                                        <span>{tallyError}</span>
+                                      </div>
+                                    )}
+                                  </div>
+
+                                  {/* Actions based on connection */}
+                                  <div className="flex flex-wrap gap-2.5">
+                                    {tallyStatus !== 'Connected' ? (
+                                      <button
+                                        type="button"
+                                        onClick={handleTestConnection}
+                                        disabled={tallyStatus === 'Connecting'}
+                                        className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400 text-white font-bold text-xs rounded-xl shadow-sm transition-colors"
+                                      >
+                                        {tallyStatus === 'Connecting' ? 'Connecting...' : 'Connect & Test'}
+                                      </button>
+                                    ) : (
+                                      <>
+                                        <button
+                                          type="button"
+                                          onClick={handleFetchMasters}
+                                          className="flex items-center gap-1.5 px-3.5 py-2 bg-zinc-900 hover:bg-zinc-800 text-white font-bold text-xs rounded-xl transition-colors"
+                                        >
+                                          <Database className="w-3.5 h-3.5" />
+                                          Fetch Masters
+                                        </button>
+                                        
+                                        <div className="flex items-center gap-2 border border-zinc-200 bg-white rounded-xl p-1.5">
+                                          <div className="flex items-center gap-1 text-[11px] text-zinc-500 font-medium">
+                                            <span>From:</span>
+                                            <input 
+                                              type="date" 
+                                              value={tallyFromDate}
+                                              onChange={(e) => setTallyFromDate(e.target.value)}
+                                              className="bg-zinc-50 border-0 text-zinc-800 text-xs px-1.5 py-0.5 rounded font-semibold focus:ring-0"
+                                            />
+                                          </div>
+                                          <div className="flex items-center gap-1 text-[11px] text-zinc-500 font-medium border-l border-zinc-200 pl-2">
+                                            <span>To:</span>
+                                            <input 
+                                              type="date" 
+                                              value={tallyToDate}
+                                              onChange={(e) => setTallyToDate(e.target.value)}
+                                              className="bg-zinc-50 border-0 text-zinc-800 text-xs px-1.5 py-0.5 rounded font-semibold focus:ring-0"
+                                            />
+                                          </div>
+                                          <button
+                                            type="button"
+                                            onClick={handleFetchDaybook}
+                                            className="flex items-center gap-1 px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] rounded-lg transition-colors"
+                                          >
+                                            <FileText className="w-3 h-3" />
+                                            Fetch Daybook
+                                          </button>
+                                        </div>
+
+                                        <button
+                                          type="button"
+                                          onClick={handleDisconnect}
+                                          className="flex items-center gap-1.5 px-3.5 py-2 bg-zinc-100 hover:bg-zinc-200 text-zinc-700 font-bold text-xs rounded-xl transition-colors"
+                                        >
+                                          <X className="w-3.5 h-3.5" />
+                                          Disconnect
+                                        </button>
+                                      </>
+                                    )}
+                                  </div>
+
+                                  {/* Helper note */}
+                                  <p className="text-[11px] text-zinc-400 leading-relaxed italic">
+                                    Keep TallyPrime open with the correct company loaded. Enable Tally integration/HTTP port in Tally. Default port is usually 9000.
+                                  </p>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Recent Tally Push Logs */}
+                        {getAppMode() === 'desktop-offline' && recentPushLogs.length > 0 && (
+                          <div className="md:col-span-2 border-t border-zinc-200/60 pt-6 mt-4" id="tally-push-logs-section">
+                            <h4 className="text-sm font-bold text-zinc-800 mb-3 flex items-center gap-2">
+                              <History className="w-4 h-4 text-zinc-500" />
+                              Recent Tally Direct Push Logs
+                            </h4>
+                            <div className="overflow-x-auto border border-zinc-200 rounded-xl bg-white max-h-60 overflow-y-auto">
+                              <table className="min-w-full divide-y divide-zinc-200 text-xs">
+                                <thead className="bg-zinc-50 sticky top-0">
+                                  <tr>
+                                    <th className="px-4 py-2.5 text-left font-bold text-zinc-600">Timestamp</th>
+                                    <th className="px-4 py-2.5 text-left font-bold text-zinc-600">Company</th>
+                                    <th className="px-4 py-2.5 text-left font-bold text-zinc-600">XML Type</th>
+                                    <th className="px-4 py-2.5 text-left font-bold text-zinc-600">Count (Vch/Mst)</th>
+                                    <th className="px-4 py-2.5 text-left font-bold text-zinc-600">Status</th>
+                                    <th className="px-4 py-2.5 text-left font-bold text-zinc-600">Result / Error</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-zinc-100 bg-white">
+                                  {recentPushLogs.map((log) => (
+                                    <tr key={log.id} className="hover:bg-zinc-50/50">
+                                      <td className="px-4 py-2 text-zinc-500 whitespace-nowrap">
+                                        {new Date(log.timestamp).toLocaleString()}
+                                      </td>
+                                      <td className="px-4 py-2 font-semibold text-zinc-800">
+                                        {log.companyName}
+                                      </td>
+                                      <td className="px-4 py-2 text-zinc-600">
+                                        {log.xmlType}
+                                      </td>
+                                      <td className="px-4 py-2 text-zinc-600 whitespace-nowrap">
+                                        Vch: <span className="font-bold">{log.voucherCount}</span>, Mst: <span className="font-bold">{log.masterCount}</span>
+                                      </td>
+                                      <td className="px-4 py-2 whitespace-nowrap">
+                                        <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-bold text-[10px] uppercase ${
+                                          log.status === 'success' ? 'bg-green-100 text-green-800' : 'bg-rose-100 text-rose-800'
+                                        }`}>
+                                          {log.status}
+                                        </span>
+                                      </td>
+                                      <td className="px-4 py-2 font-medium">
+                                        {log.status === 'success' ? (
+                                          <span className="text-green-600">Import successful</span>
+                                        ) : (
+                                          <span className="text-rose-600 break-all max-w-xs block" title={log.errorMessage}>
+                                            {log.errorMessage || 'Unknown error'}
+                                          </span>
+                                        )}
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        )}
                       </div>
 
                       {/* Summary / Progress of loading */}
@@ -9785,6 +10474,28 @@ export default function App() {
                         <FileCode className="w-5 h-5" />
                         Download XML
                       </button>
+
+                      {getAppMode() === 'desktop-offline' && isDirectTallyAvailable() && tallyStatus === 'Connected' && (
+                        <button 
+                          onClick={() => {
+                            const lastConv = conversions[0];
+                            if (lastConv?.xmlContent) {
+                              const type = lastConv.voucherType || 'Voucher';
+                              const count = lastConv.voucherCount || 0;
+                              initiateTallyPush(
+                                lastConv.xmlContent,
+                                type,
+                                count,
+                                0
+                              );
+                            }
+                          }}
+                          className="flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white py-3 px-8 rounded-xl font-bold transition-colors"
+                        >
+                          <RefreshCw className="w-5 h-5" />
+                          Push to Tally
+                        </button>
+                      )}
                       
                       {conversions[0]?.voucherType === 'SalesPurchase' ? null : importType === 'Voucher' ? (
                         <button 
@@ -10111,6 +10822,122 @@ export default function App() {
                     </>
                   ) : (
                     'Yes, Restart'
+                  )}
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Direct Tally Push Confirmation Modal */}
+      <AnimatePresence>
+        {isPushModalOpen && pushModalData && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4" id="tally-push-modal">
+            {/* Backdrop */}
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => {
+                if (!isPushing) setIsPushModalOpen(false);
+              }}
+              className="fixed inset-0 bg-zinc-900/40 backdrop-blur-sm"
+              id="tally-push-backdrop"
+            />
+            
+            {/* Modal Content */}
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 10 }}
+              transition={{ duration: 0.2, ease: "easeOut" }}
+              className="bg-white w-full max-w-md rounded-2xl p-6 shadow-xl border border-zinc-200 relative z-10"
+              id="tally-push-container"
+            >
+              <div className="flex items-start gap-4 mb-4">
+                <div className="w-10 h-10 bg-emerald-50 rounded-xl flex items-center justify-center text-emerald-600 flex-shrink-0" id="tally-push-icon-bg">
+                  <RefreshCw className="w-5 h-5 animate-spin-slow" id="tally-push-icon" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-zinc-900" id="tally-push-title">Push XML directly to TallyPrime</h3>
+                  <p className="text-zinc-500 text-xs mt-1 leading-relaxed">
+                    Review import details before pushing generated entries directly into your local running Tally instance.
+                  </p>
+                </div>
+              </div>
+
+              {/* Tally Details Grid */}
+              <div className="bg-zinc-50 border border-zinc-200 rounded-xl p-4 space-y-2.5 mb-5 text-xs text-zinc-700" id="tally-push-details">
+                <div className="flex justify-between">
+                  <span className="font-semibold text-zinc-500">Target Company:</span>
+                  <span className="font-bold text-emerald-700 break-all text-right">{pushModalData.companyName}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="font-semibold text-zinc-500">XML Type:</span>
+                  <span className="font-bold text-zinc-800">{pushModalData.xmlType}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="font-semibold text-zinc-500">Voucher Count:</span>
+                  <span className="font-bold text-zinc-800">{pushModalData.voucherCount}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="font-semibold text-zinc-500">Missing Masters Created:</span>
+                  <span className="font-bold text-zinc-800">{pushModalData.masterCount}</span>
+                </div>
+              </div>
+
+              {/* Warning Alert */}
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-3.5 text-xs text-amber-800 flex items-start gap-2 mb-5" id="tally-push-warning">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+                <div>
+                  <span className="font-bold block">Safety Recommendation</span>
+                  <span className="text-amber-700 mt-0.5 block leading-relaxed">
+                    Please ensure you have a backup of your Tally company data before continuing with the direct XML import.
+                  </span>
+                </div>
+              </div>
+
+              {/* Buttons */}
+              <div className="flex flex-col sm:flex-row items-center justify-end gap-2.5" id="tally-push-actions">
+                <button
+                  type="button"
+                  onClick={() => setIsPushModalOpen(false)}
+                  disabled={isPushing}
+                  className="w-full sm:w-auto px-4 py-2.5 bg-zinc-50 hover:bg-zinc-100 border border-zinc-200 rounded-xl text-zinc-700 font-bold text-xs transition-colors"
+                  id="tally-push-cancel-btn"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    downloadXML(pushModalData.xmlContent, 'TallyGen_Backup_' + Date.now() + '.xml');
+                  }}
+                  disabled={isPushing}
+                  className="w-full sm:w-auto px-4 py-2.5 bg-white hover:bg-zinc-50 border border-zinc-200 rounded-xl text-zinc-700 font-bold text-xs transition-colors flex items-center justify-center gap-1.5"
+                  id="tally-push-backup-btn"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Download Backup XML
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDirectPushToTally}
+                  disabled={isPushing}
+                  className="w-full sm:w-auto flex items-center justify-center gap-1.5 px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400 text-white rounded-xl font-bold text-xs transition-colors shadow-md shadow-emerald-500/10"
+                  id="tally-push-confirm-btn"
+                >
+                  {isPushing ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      Pushing...
+                    </>
+                  ) : (
+                    <>
+                      <Check className="w-3.5 h-3.5" />
+                      Push to Tally
+                    </>
                   )}
                 </button>
               </div>

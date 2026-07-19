@@ -36,20 +36,23 @@ export const OFFLINE_USER: OfflineUser = {
 
 // --- IndexedDB Setup for Desktop Offline ---
 const DB_NAME = 'tallygen_offline_db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onerror = () => reject(request.error);
     request.onsuccess = () => resolve(request.result);
-    request.onupgradeneeded = () => {
+    request.onupgradeneeded = (event: any) => {
       const db = request.result;
       if (!db.objectStoreNames.contains('tally_context')) {
         db.createObjectStore('tally_context', { keyPath: 'userId' });
       }
       if (!db.objectStoreNames.contains('conversions')) {
         db.createObjectStore('conversions', { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains('tally_push_logs')) {
+        db.createObjectStore('tally_push_logs', { keyPath: 'id' });
       }
     };
   });
@@ -316,4 +319,34 @@ export async function clearOfflineWorkspace(userId: string): Promise<void> {
     await idbDelete('tally_context', userId);
     notifyTallyContext(userId, null);
   }
+}
+
+export interface TallyPushLog {
+  id: string;
+  timestamp: number; // epoch ms
+  companyName: string;
+  host: string;
+  port: number;
+  xmlType: string;
+  voucherCount: number;
+  masterCount: number;
+  status: 'success' | 'failed';
+  tallyResponse?: string;
+  errorMessage?: string;
+}
+
+export async function saveTallyPushLog(log: Omit<TallyPushLog, 'id' | 'timestamp'>): Promise<string> {
+  const id = 'log_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
+  const item: TallyPushLog = {
+    id,
+    timestamp: Date.now(),
+    ...log
+  };
+  await idbPut('tally_push_logs', item);
+  return id;
+}
+
+export async function getTallyPushLogs(): Promise<TallyPushLog[]> {
+  const logs = await idbGetAll('tally_push_logs');
+  return logs.sort((a, b) => b.timestamp - a.timestamp);
 }
