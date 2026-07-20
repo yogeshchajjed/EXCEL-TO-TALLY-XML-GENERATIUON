@@ -13,5 +13,8 @@ contextBridge.exposeInMainWorld('electron', {
     fetchUnits: (config: any, xml: string) => ipcRenderer.invoke('tally:fetchUnits', { config, xml }),
     fetchDaybook: (config: any, xml: string) => ipcRenderer.invoke('tally:fetchDaybook', { config, xml }),
     pushXml: (config: any, xml: string) => ipcRenderer.invoke('tally:pushXml', { config, xml }),
+    fetchCompanies: (config: any, xml: string) => ipcRenderer.invoke('tally:fetchCompanies', { config, xml }),
+    fetchMastersForCompany: (config: any, xml: string) => ipcRenderer.invoke('tally:fetchMastersForCompany', { config, xml }),
+    fetchDaybookForCompany: (config: any, xml: string) => ipcRenderer.invoke('tally:fetchDaybookForCompany', { config, xml }),
   },
 });

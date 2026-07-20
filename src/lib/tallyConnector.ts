@@ -1,5 +1,6 @@
 import { getAppMode } from './storageAdapter';
 import { ElectronTallyConfig, ElectronTallyResponse } from '../types/electron';
+import * as XLSX from 'xlsx';
 
 export interface LedgerMasterRow {
   rowNum: number;
@@ -616,4 +617,850 @@ export async function pushXmlToTally(config: ElectronTallyConfig, xml: string): 
   }
   const payload = buildImportXmlRequest(xml);
   return await window.electron.tally.pushXml(config, payload);
+}
+
+export interface FetchMasterFailure {
+  type: 'Ledger' | 'Group' | 'StockItem' | 'Unit' | 'VoucherType';
+  name: string;
+  reason: string;
+}
+
+export interface MastersFetchSummary {
+  companyName: string;
+  fetchedAt: number;
+  ledgers: { total: number; fetched: number; failed: number };
+  groups: { total: number; fetched: number; failed: number };
+  stockItems: { total: number; fetched: number; failed: number };
+  units: { total: number; fetched: number; failed: number };
+  voucherTypes: { total: number; fetched: number; failed: number };
+  failures: FetchMasterFailure[];
+}
+
+export interface FetchTransactionFailure {
+  date: string;
+  voucherNo: string;
+  voucherType: string;
+  reason: string;
+}
+
+export interface DaybookFetchSummary {
+  companyName: string;
+  fromDate: string;
+  toDate: string;
+  totalVouchers: number;
+  fetchedVouchers: number;
+  failedVouchers: number;
+  failures: FetchTransactionFailure[];
+}
+
+/**
+ * XML builder to fetch all loaded/open companies from TallyPrime
+ */
+export function buildExportCompaniesRequest(): string {
+  return `
+<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export Data</TALLYREQUEST>
+    <TYPE>Collection</TYPE>
+    <ID>ListofCompanies</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <COLLECTION NAME="ListofCompanies">
+            <TYPE>Company</TYPE>
+            <FETCH>Name, GUID</FETCH>
+          </COLLECTION>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>`.trim();
+}
+
+/**
+ * XML builder to fetch all Voucher Types for a company
+ */
+export function buildExportVoucherTypesRequest(companyName?: string): string {
+  const companyVar = companyName ? `<SVCOMPANYNAME>${companyName}</SVCOMPANYNAME>` : '';
+  return `
+<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export Data</TALLYREQUEST>
+    <TYPE>Collection</TYPE>
+    <ID>VoucherTypeCollection</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+        ${companyVar}
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <COLLECTION NAME="VoucherTypeCollection">
+            <TYPE>VoucherType</TYPE>
+            <FETCH>Name</FETCH>
+          </COLLECTION>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>`.trim();
+}
+
+/**
+ * Parses company list response from Tally
+ */
+export function parseCompanyListResponse(responseXml: string): { name: string; guid: string; isActive: boolean }[] {
+  try {
+    const parser = new DOMParser();
+    const xmlDoc = parser.parseFromString(responseXml, "text/xml");
+    
+    const parserError = xmlDoc.getElementsByTagName("parsererror");
+    if (parserError.length > 0) {
+      console.error("XML parse error in company list", parserError[0].textContent);
+    }
+    
+    const companies: { name: string; guid: string; isActive: boolean }[] = [];
+    const companyNodes = xmlDoc.getElementsByTagName("COMPANY");
+    
+    if (companyNodes.length > 0) {
+      for (let i = 0; i < companyNodes.length; i++) {
+        const node = companyNodes[i];
+        const name = node.getAttribute("NAME") || node.getElementsByTagName("NAME")[0]?.textContent || "";
+        const guid = node.getElementsByTagName("GUID")[0]?.textContent || "";
+        if (name) {
+          companies.push({ name: name.trim(), guid: guid.trim(), isActive: true });
+        }
+      }
+    } else {
+      const activeCompanyTags = ["SVCURRENTCOMPANY", "SVCOMPANYNAME", "COMPANYNAME", "REDCURRENTCOMPANY", "CURRENTCOMPANY"];
+      for (const tag of activeCompanyTags) {
+        const els = xmlDoc.getElementsByTagName(tag);
+        if (els.length > 0 && els[0].textContent) {
+          companies.push({ name: els[0].textContent.trim(), guid: "", isActive: true });
+          break;
+        }
+      }
+    }
+    
+    const uniqueMap = new Map<string, { name: string; guid: string; isActive: boolean }>();
+    companies.forEach(c => uniqueMap.set(c.name.toLowerCase(), c));
+    return Array.from(uniqueMap.values());
+  } catch (err) {
+    console.error("Error parsing company list response", err);
+    return [];
+  }
+}
+
+/**
+ * Fetches all available companies in local Tally
+ */
+export async function fetchCompaniesFromTally(config: ElectronTallyConfig): Promise<{ name: string; guid: string; isActive: boolean }[]> {
+  if (!isDirectTallyAvailable()) {
+    throw new Error("Direct Tally connection is only available in Desktop Offline App.");
+  }
+  const xml = buildExportCompaniesRequest();
+  const res = await window.electron.tally.fetchCompanies(config, xml);
+  if (!res.success) {
+    throw new Error(res.error || "Failed to fetch companies from Tally.");
+  }
+  return parseCompanyListResponse(res.response || "");
+}
+
+/**
+ * Builds scoped company XML request
+ */
+export function buildCompanyScopedExportRequest(
+  companyName: string,
+  reportType: 'Ledgers' | 'Groups' | 'StockItems' | 'Units' | 'Daybook',
+  params?: any
+): string {
+  const companyVar = companyName ? `<SVCOMPANYNAME>${companyName}</SVCOMPANYNAME>` : '';
+  
+  if (reportType === 'Ledgers') {
+    return `
+<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export Data</TALLYREQUEST>
+    <TYPE>Collection</TYPE>
+    <ID>LedgerCollection</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+        ${companyVar}
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <COLLECTION NAME="LedgerCollection">
+            <TYPE>Ledger</TYPE>
+            <FETCH>Name, Parent, OpeningBalance, MailingName, Address, LEDState, PINCode, IncomeTaxNumber, GSTRegistrationType, PartyGSTIN, Email, Phone</FETCH>
+          </COLLECTION>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>`.trim();
+  } else if (reportType === 'Groups') {
+    return `
+<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export Data</TALLYREQUEST>
+    <TYPE>Collection</TYPE>
+    <ID>GroupCollection</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+        ${companyVar}
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <COLLECTION NAME="GroupCollection">
+            <TYPE>Group</TYPE>
+            <FETCH>Name, Parent</FETCH>
+          </COLLECTION>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>`.trim();
+  } else if (reportType === 'StockItems') {
+    return `
+<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export Data</TALLYREQUEST>
+    <TYPE>Collection</TYPE>
+    <ID>StockItemCollection</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+        ${companyVar}
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <COLLECTION NAME="StockItemCollection">
+            <TYPE>StockItem</TYPE>
+            <FETCH>Name, Parent, BaseUnits, OpeningBalance, OpeningRate, OpeningValue, HSNCode, GSTApplicable, TAXABILITY, Description, IGSTRate, CGSTRate, SGSTRate</FETCH>
+          </COLLECTION>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>`.trim();
+  } else if (reportType === 'Units') {
+    return `
+<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export Data</TALLYREQUEST>
+    <TYPE>Collection</TYPE>
+    <ID>UnitCollection</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+        ${companyVar}
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <COLLECTION NAME="UnitCollection">
+            <TYPE>Unit</TYPE>
+            <FETCH>Name, OriginalName, DecimalPlaces</FETCH>
+          </COLLECTION>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>`.trim();
+  } else {
+    const fromDate = params?.fromDate || '';
+    const toDate = params?.toDate || '';
+    const fDate = fromDate.replace(/-/g, '');
+    const tDate = toDate.replace(/-/g, '');
+    return `
+<ENVELOPE>
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>Export Data</TALLYREQUEST>
+    <TYPE>Collection</TYPE>
+    <ID>DaybookCollection</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES>
+        <SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>
+        <SVFROMDATE>${fDate}</SVFROMDATE>
+        <SVTODATE>${tDate}</SVTODATE>
+        ${companyVar}
+      </STATICVARIABLES>
+      <TDL>
+        <TDLMESSAGE>
+          <COLLECTION NAME="DaybookCollection">
+            <TYPE>Voucher</TYPE>
+            <FETCH>Date, VoucherTypeName, VoucherNumber, Narration, Reference, LedgerEntries, AllLedgerEntries</FETCH>
+          </COLLECTION>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>`.trim();
+  }
+}
+
+/**
+ * Parses fetched masters xmls with complete failure/skip details
+ */
+export function parseMastersWithSummary(
+  companyName: string,
+  xmls: { groupsXml: string; ledgersXml: string; stockItemsXml: string; unitsXml: string; voucherTypesXml: string }
+): {
+  parsedMasters: any;
+  summary: MastersFetchSummary;
+} {
+  const failures: FetchMasterFailure[] = [];
+  
+  // 1. Groups
+  const groupParser = new DOMParser();
+  const groupDoc = groupParser.parseFromString(xmls.groupsXml, "text/xml");
+  const groupNodes = groupDoc.getElementsByTagName("GROUP");
+  const groups: string[] = [];
+  const groupParentMap: Record<string, string> = {};
+  
+  let totalGroups = groupNodes.length;
+  let fetchedGroups = 0;
+  
+  for (let i = 0; i < groupNodes.length; i++) {
+    const node = groupNodes[i];
+    const name = node.getAttribute("NAME") || node.getElementsByTagName("NAME")[0]?.textContent || "";
+    if (!name) {
+      failures.push({ type: 'Group', name: `Group #${i+1}`, reason: 'Missing name' });
+      continue;
+    }
+    const parent = node.getElementsByTagName("PARENT")[0]?.textContent || "";
+    if (groups.includes(name)) {
+      failures.push({ type: 'Group', name, reason: 'Duplicate master ignored' });
+      continue;
+    }
+    groups.push(name);
+    if (parent) {
+      groupParentMap[name] = parent;
+    }
+    fetchedGroups++;
+  }
+  
+  // 2. Ledgers
+  const ledgerParser = new DOMParser();
+  const ledgerDoc = ledgerParser.parseFromString(xmls.ledgersXml, "text/xml");
+  const ledgerNodes = ledgerDoc.getElementsByTagName("LEDGER");
+  const ledgers: LedgerMasterRow[] = [];
+  const ledgerNames: string[] = [];
+  const ledgerGroupMap: Record<string, string> = {};
+  
+  let totalLedgers = ledgerNodes.length;
+  let fetchedLedgers = 0;
+  
+  for (let i = 0; i < ledgerNodes.length; i++) {
+    const node = ledgerNodes[i];
+    const name = node.getAttribute("NAME") || node.getElementsByTagName("NAME")[0]?.textContent || "";
+    if (!name) {
+      failures.push({ type: 'Ledger', name: `Ledger #${i+1}`, reason: 'Missing name' });
+      continue;
+    }
+    const underGroup = node.getElementsByTagName("PARENT")[0]?.textContent || "";
+    if (!underGroup) {
+      failures.push({ type: 'Ledger', name, reason: 'Parent group missing' });
+      continue;
+    }
+    if (ledgerNames.includes(name)) {
+      failures.push({ type: 'Ledger', name, reason: 'Duplicate master ignored' });
+      continue;
+    }
+    
+    ledgerNames.push(name);
+    ledgerGroupMap[name] = underGroup;
+    
+    const gstin = node.getElementsByTagName("PARTYGSTIN")[0]?.textContent || "";
+    const regType = node.getElementsByTagName("GSTREGISTRATIONTYPE")[0]?.textContent || "";
+    if (regType && regType !== 'Unregistered' && gstin && gstin.length !== 15) {
+      failures.push({ type: 'Ledger', name, reason: 'Invalid GSTIN length (warning)' });
+    }
+    
+    const openingBalance = node.getElementsByTagName("OPENINGBALANCE")[0]?.textContent || "";
+    const mailingName = node.getElementsByTagName("MAILINGNAME")[0]?.textContent || name;
+    const addressNodes = node.getElementsByTagName("ADDRESS");
+    const address1 = addressNodes[0]?.textContent || "";
+    const address2 = addressNodes[1]?.textContent || "";
+    const state = node.getElementsByTagName("LEDSTATENAME")[0]?.textContent || "";
+    const country = node.getElementsByTagName("COUNTRYNAME")[0]?.textContent || "India";
+    const pincode = node.getElementsByTagName("PINCODE")[0]?.textContent || "";
+    const pan = node.getElementsByTagName("INCOMETAXNUMBER")[0]?.textContent || "";
+    const email = node.getElementsByTagName("EMAIL")[0]?.textContent || "";
+    
+    ledgers.push({
+      rowNum: ledgers.length + 1,
+      ledgerName: name,
+      underGroup,
+      openingBalance,
+      mailingName,
+      address1,
+      address2,
+      state,
+      country,
+      pincode,
+      pan,
+      gstin,
+      registrationType: regType,
+      isValid: true,
+      errors: [],
+      warnings: [],
+      isDuplicate: false,
+      isPossibleDuplicate: false,
+      excluded: false
+    });
+    fetchedLedgers++;
+  }
+  
+  // 3. Stock Items
+  const stockParser = new DOMParser();
+  const stockDoc = stockParser.parseFromString(xmls.stockItemsXml, "text/xml");
+  const stockNodes = stockDoc.getElementsByTagName("STOCKITEM");
+  const stockItems: StockMasterRow[] = [];
+  const stockItemNames: string[] = [];
+  const stockItemStockGroupMap: Record<string, string> = {};
+  
+  let totalStockItems = stockNodes.length;
+  let fetchedStockItems = 0;
+  
+  for (let i = 0; i < stockNodes.length; i++) {
+    const node = stockNodes[i];
+    const name = node.getAttribute("NAME") || node.getElementsByTagName("NAME")[0]?.textContent || "";
+    if (!name) {
+      failures.push({ type: 'StockItem', name: `StockItem #${i+1}`, reason: 'Missing name' });
+      continue;
+    }
+    const underGroup = node.getElementsByTagName("PARENT")[0]?.textContent || "Primary";
+    const unit = node.getElementsByTagName("BASEUNITS")[0]?.textContent || "";
+    if (!unit) {
+      failures.push({ type: 'StockItem', name, reason: 'Invalid stock unit / missing unit mapping' });
+      continue;
+    }
+    if (stockItemNames.includes(name)) {
+      failures.push({ type: 'StockItem', name, reason: 'Duplicate master ignored' });
+      continue;
+    }
+    
+    stockItemNames.push(name);
+    stockItemStockGroupMap[name] = underGroup;
+    
+    const openingQty = node.getElementsByTagName("OPENINGBALANCE")[0]?.textContent || "";
+    const openingRate = node.getElementsByTagName("OPENINGRATE")[0]?.textContent || "";
+    const openingValue = node.getElementsByTagName("OPENINGVALUE")[0]?.textContent || "";
+    const hsn = node.getElementsByTagName("HSNCODE")[0]?.textContent || "";
+    const gstApplicable = node.getElementsByTagName("GSTAPPLICABLE")[0]?.textContent || "";
+    const taxability = node.getElementsByTagName("TAXABILITY")[0]?.textContent || "";
+    const description = node.getElementsByTagName("DESCRIPTION")[0]?.textContent || "";
+    const igst = node.getElementsByTagName("IGSTRATE")[0]?.textContent || "";
+    const cgst = node.getElementsByTagName("CGSTRATE")[0]?.textContent || "";
+    const sgst = node.getElementsByTagName("SGSTRATE")[0]?.textContent || "";
+    
+    stockItems.push({
+      rowNum: stockItems.length + 1,
+      itemName: name,
+      underGroup,
+      unit,
+      openingQty,
+      openingRate,
+      openingValue,
+      hsn,
+      gstApplicable,
+      taxability,
+      gstRate: igst,
+      cgstRate: cgst,
+      sgstRate: sgst,
+      igstRate: igst,
+      description,
+      isValid: true,
+      errors: [],
+      warnings: []
+    });
+    fetchedStockItems++;
+  }
+  
+  // 4. Units
+  const unitParser = new DOMParser();
+  const unitDoc = unitParser.parseFromString(xmls.unitsXml, "text/xml");
+  const unitNodes = unitDoc.getElementsByTagName("UNIT");
+  const units: string[] = [];
+  
+  let totalUnits = unitNodes.length;
+  let fetchedUnits = 0;
+  
+  for (let i = 0; i < unitNodes.length; i++) {
+    const node = unitNodes[i];
+    const name = node.getAttribute("NAME") || node.getElementsByTagName("NAME")[0]?.textContent || "";
+    if (!name) {
+      failures.push({ type: 'Unit', name: `Unit #${i+1}`, reason: 'Missing unit name' });
+      continue;
+    }
+    if (units.includes(name)) {
+      failures.push({ type: 'Unit', name, reason: 'Duplicate master ignored' });
+      continue;
+    }
+    units.push(name);
+    fetchedUnits++;
+  }
+  
+  // 5. Voucher Types
+  const vtParser = new DOMParser();
+  const vtDoc = vtParser.parseFromString(xmls.voucherTypesXml, "text/xml");
+  const vtNodes = vtDoc.getElementsByTagName("VOUCHERTYPE");
+  const voucherTypes: string[] = [];
+  
+  let totalVoucherTypes = vtNodes.length;
+  let fetchedVoucherTypes = 0;
+  
+  for (let i = 0; i < vtNodes.length; i++) {
+    const node = vtNodes[i];
+    const name = node.getAttribute("NAME") || node.getElementsByTagName("NAME")[0]?.textContent || "";
+    if (!name) {
+      failures.push({ type: 'VoucherType', name: `VoucherType #${i+1}`, reason: 'Missing voucher type name' });
+      continue;
+    }
+    if (voucherTypes.includes(name)) {
+      failures.push({ type: 'VoucherType', name, reason: 'Duplicate master ignored' });
+      continue;
+    }
+    voucherTypes.push(name);
+    fetchedVoucherTypes++;
+  }
+  
+  const summary: MastersFetchSummary = {
+    companyName,
+    fetchedAt: Date.now(),
+    ledgers: { total: totalLedgers, fetched: fetchedLedgers, failed: totalLedgers - fetchedLedgers },
+    groups: { total: totalGroups, fetched: fetchedGroups, failed: totalGroups - fetchedGroups },
+    stockItems: { total: totalStockItems, fetched: fetchedStockItems, failed: totalStockItems - fetchedStockItems },
+    units: { total: totalUnits, fetched: fetchedUnits, failed: totalUnits - fetchedUnits },
+    voucherTypes: { total: totalVoucherTypes, fetched: fetchedVoucherTypes, failed: totalVoucherTypes - fetchedVoucherTypes },
+    failures
+  };
+  
+  const parsedMasters = {
+    ledgers: ledgerNames,
+    groups,
+    groupParentMap,
+    stockItems: stockItemNames,
+    stockGroups: Array.from(new Set(stockItems.map(si => si.underGroup))),
+    units,
+    ledgerGroupMap,
+    stockItemStockGroupMap,
+    ledgerDetails: ledgers,
+    stockItemDetails: stockItems
+  };
+  
+  return { parsedMasters, summary };
+}
+
+/**
+ * Parses fetched Daybook vouchers with failure details
+ */
+export function parseDaybookWithSummary(
+  companyName: string,
+  fromDate: string,
+  toDate: string,
+  xml: string
+): {
+  transactions: TallyDaybookTransaction[];
+  summary: DaybookFetchSummary;
+} {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xml, "text/xml");
+  const transactions: TallyDaybookTransaction[] = [];
+  const failures: FetchTransactionFailure[] = [];
+  
+  const voucherNodes = doc.getElementsByTagName("VOUCHER");
+  let totalVouchers = voucherNodes.length;
+  let fetchedVouchers = 0;
+  
+  for (let i = 0; i < voucherNodes.length; i++) {
+    const node = voucherNodes[i];
+    const date = node.getElementsByTagName("DATE")[0]?.textContent || "";
+    const voucherType = node.getElementsByTagName("VOUCHERTYPENAME")[0]?.textContent || "";
+    const voucherNo = node.getElementsByTagName("VOUCHERNUMBER")[0]?.textContent || `Index #${i+1}`;
+    const narration = node.getElementsByTagName("NARRATION")[0]?.textContent || "";
+    const reference = node.getElementsByTagName("REFERENCE")[0]?.textContent || "";
+    
+    if (!date || date.length !== 8) {
+      failures.push({
+        date: date || 'N/A',
+        voucherNo,
+        voucherType: voucherType || 'N/A',
+        reason: 'Invalid date format (must be YYYYMMDD)'
+      });
+      continue;
+    }
+    
+    if (!voucherType) {
+      failures.push({
+        date,
+        voucherNo,
+        voucherType: 'N/A',
+        reason: 'Missing voucher type'
+      });
+      continue;
+    }
+    
+    const ledgerList = node.getElementsByTagName("ALLLEDGERENTRIES.LIST");
+    if (ledgerList.length === 0) {
+      failures.push({
+        date,
+        voucherNo,
+        voucherType,
+        reason: 'Ledger entries missing'
+      });
+      continue;
+    }
+    
+    let hasLedger = false;
+    let hasZeroAmount = false;
+    for (let j = 0; j < ledgerList.length; j++) {
+      const entry = ledgerList[j];
+      const ledger = entry.getElementsByTagName("LEDGERNAME")[0]?.textContent || "";
+      const amountStr = entry.getElementsByTagName("AMOUNT")[0]?.textContent || "0";
+      const amount = parseFloat(amountStr);
+      
+      if (!ledger) {
+        continue;
+      }
+      
+      hasLedger = true;
+      if (amount === 0 || isNaN(amount)) {
+        hasZeroAmount = true;
+      }
+      
+      transactions.push({
+        date,
+        voucherType,
+        narration,
+        ledger,
+        amount,
+        reference
+      });
+    }
+    
+    if (!hasLedger) {
+      failures.push({
+        date,
+        voucherNo,
+        voucherType,
+        reason: 'Missing ledger names in entries'
+      });
+      continue;
+    }
+    
+    if (hasZeroAmount) {
+      failures.push({
+        date,
+        voucherNo,
+        voucherType,
+        reason: 'Zero amount entry found (warning)'
+      });
+    }
+    
+    fetchedVouchers++;
+  }
+  
+  const summary: DaybookFetchSummary = {
+    companyName,
+    fromDate,
+    toDate,
+    totalVouchers,
+    fetchedVouchers,
+    failedVouchers: totalVouchers - fetchedVouchers,
+    failures
+  };
+  
+  return { transactions, summary };
+}
+
+/**
+ * Fetches all Tally masters for selected company with detailed summary
+ */
+export async function fetchMastersForCompany(
+  config: ElectronTallyConfig,
+  companyName: string
+): Promise<{ parsedMasters: any; summary: MastersFetchSummary }> {
+  if (!isDirectTallyAvailable()) {
+    throw new Error("Direct Tally connection is not available in Web mode.");
+  }
+  
+  const groupsRes = await window.electron.tally.fetchMastersForCompany(config, buildCompanyScopedExportRequest(companyName, 'Groups'));
+  if (!groupsRes.success) throw new Error("Failed to fetch Groups: " + groupsRes.error);
+  
+  const ledgersRes = await window.electron.tally.fetchMastersForCompany(config, buildCompanyScopedExportRequest(companyName, 'Ledgers'));
+  if (!ledgersRes.success) throw new Error("Failed to fetch Ledgers: " + ledgersRes.error);
+  
+  const stockItemsRes = await window.electron.tally.fetchMastersForCompany(config, buildCompanyScopedExportRequest(companyName, 'StockItems'));
+  if (!stockItemsRes.success) throw new Error("Failed to fetch Stock Items: " + stockItemsRes.error);
+  
+  const unitsRes = await window.electron.tally.fetchMastersForCompany(config, buildCompanyScopedExportRequest(companyName, 'Units'));
+  if (!unitsRes.success) throw new Error("Failed to fetch Units: " + unitsRes.error);
+  
+  const vtRes = await window.electron.tally.testConnection(config, buildExportVoucherTypesRequest(companyName));
+  if (!vtRes.success) throw new Error("Failed to fetch Voucher Types: " + vtRes.error);
+  
+  return parseMastersWithSummary(companyName, {
+    groupsXml: groupsRes.response || "",
+    ledgersXml: ledgersRes.response || "",
+    stockItemsXml: stockItemsRes.response || "",
+    unitsXml: unitsRes.response || "",
+    voucherTypesXml: vtRes.response || ""
+  });
+}
+
+/**
+ * Fetches company scoped Daybook transactions with detailed summary
+ */
+export async function fetchDaybookForCompany(
+  config: ElectronTallyConfig,
+  companyName: string,
+  fromDate: string,
+  toDate: string
+): Promise<{ transactions: TallyDaybookTransaction[]; summary: DaybookFetchSummary }> {
+  if (!isDirectTallyAvailable()) {
+    throw new Error("Direct Tally connection is not available in Web mode.");
+  }
+  const xml = buildCompanyScopedExportRequest(companyName, 'Daybook', { fromDate, toDate });
+  const response = await window.electron.tally.fetchDaybookForCompany(config, xml);
+  if (!response.success) {
+    throw new Error("Failed to fetch Daybook: " + response.error);
+  }
+  return parseDaybookWithSummary(companyName, fromDate, toDate, response.response || "");
+}
+
+/**
+ * Exports Fetch Report as Excel workbook with Summary, Fetched and Failed sheets
+ */
+export function generateFetchReportExcel(
+  mastersSummary?: MastersFetchSummary,
+  daybookSummary?: DaybookFetchSummary,
+  parsedMastersData?: any,
+  parsedTransactions?: TallyDaybookTransaction[]
+) {
+  const wb = XLSX.utils.book_new();
+  
+  // Sheet 1: Summary
+  const summaryRows: any[] = [];
+  summaryRows.push(['TALLYGEN PRO - FETCH REPORT', '']);
+  summaryRows.push(['Generated At', new Date().toLocaleString()]);
+  summaryRows.push(['', '']);
+  
+  if (mastersSummary) {
+    summaryRows.push(['MASTERS FETCH SUMMARY', '']);
+    summaryRows.push(['Company Name', mastersSummary.companyName]);
+    summaryRows.push(['Fetched At', new Date(mastersSummary.fetchedAt).toLocaleString()]);
+    summaryRows.push(['Master Type', 'Available in Tally', 'Fetched Successfully', 'Failed/Skipped']);
+    summaryRows.push(['Ledgers', mastersSummary.ledgers.total, mastersSummary.ledgers.fetched, mastersSummary.ledgers.failed]);
+    summaryRows.push(['Groups', mastersSummary.groups.total, mastersSummary.groups.fetched, mastersSummary.groups.failed]);
+    summaryRows.push(['Stock Items', mastersSummary.stockItems.total, mastersSummary.stockItems.fetched, mastersSummary.stockItems.failed]);
+    summaryRows.push(['Units', mastersSummary.units.total, mastersSummary.units.fetched, mastersSummary.units.failed]);
+    summaryRows.push(['Voucher Types', mastersSummary.voucherTypes.total, mastersSummary.voucherTypes.fetched, mastersSummary.voucherTypes.failed]);
+    summaryRows.push(['', '', '', '']);
+  }
+  
+  if (daybookSummary) {
+    summaryRows.push(['DAYBOOK TRANSACTION FETCH SUMMARY', '']);
+    summaryRows.push(['Company Name', daybookSummary.companyName]);
+    summaryRows.push(['Date Range', `${daybookSummary.fromDate} to ${daybookSummary.toDate}`]);
+    summaryRows.push(['Metric', 'Count']);
+    summaryRows.push(['Total Vouchers Found', daybookSummary.totalVouchers]);
+    summaryRows.push(['Successfully Parsed', daybookSummary.fetchedVouchers]);
+    summaryRows.push(['Skipped / Failed', daybookSummary.failedVouchers]);
+  }
+  
+  const summaryWs = XLSX.utils.aoa_to_sheet(summaryRows);
+  XLSX.utils.book_append_sheet(wb, summaryWs, 'Summary');
+  
+  // Sheet 2: Fetched Masters
+  const fetchedMastersRows: any[] = [];
+  fetchedMastersRows.push(['Master Type', 'Master Name', 'Parent Group/Unit/Details']);
+  if (parsedMastersData) {
+    if (parsedMastersData.ledgers) {
+      parsedMastersData.ledgers.forEach((l: string) => {
+        const parent = parsedMastersData.ledgerGroupMap?.[l] || '';
+        fetchedMastersRows.push(['Ledger', l, parent]);
+      });
+    }
+    if (parsedMastersData.groups) {
+      parsedMastersData.groups.forEach((g: string) => {
+        const parent = parsedMastersData.groupParentMap?.[g] || '';
+        fetchedMastersRows.push(['Group', g, parent]);
+      });
+    }
+    if (parsedMastersData.stockItems) {
+      parsedMastersData.stockItems.forEach((si: string) => {
+        const parent = parsedMastersData.stockItemStockGroupMap?.[si] || '';
+        fetchedMastersRows.push(['Stock Item', si, parent]);
+      });
+    }
+    if (parsedMastersData.units) {
+      parsedMastersData.units.forEach((u: string) => {
+        fetchedMastersRows.push(['Unit', u, '']);
+      });
+    }
+  }
+  const fetchedMastersWs = XLSX.utils.aoa_to_sheet(fetchedMastersRows);
+  XLSX.utils.book_append_sheet(wb, fetchedMastersWs, 'Fetched Masters');
+  
+  // Sheet 3: Failed Masters
+  const failedMastersRows: any[] = [];
+  failedMastersRows.push(['Master Type', 'Name', 'Reason for Failure / Skip']);
+  if (mastersSummary && mastersSummary.failures) {
+    mastersSummary.failures.forEach(f => {
+      failedMastersRows.push([f.type, f.name, f.reason]);
+    });
+  }
+  const failedMastersWs = XLSX.utils.aoa_to_sheet(failedMastersRows);
+  XLSX.utils.book_append_sheet(wb, failedMastersWs, 'Failed Masters');
+  
+  // Sheet 4: Fetched Transactions
+  const fetchedTxRows: any[] = [];
+  fetchedTxRows.push(['Date', 'Voucher Type', 'Ledger Name', 'Amount', 'Narration', 'Reference']);
+  if (parsedTransactions) {
+    parsedTransactions.forEach(t => {
+      fetchedTxRows.push([t.date, t.voucherType, t.ledger, t.amount, t.narration, t.reference]);
+    });
+  }
+  const fetchedTxWs = XLSX.utils.aoa_to_sheet(fetchedTxRows);
+  XLSX.utils.book_append_sheet(wb, fetchedTxWs, 'Fetched Transactions');
+  
+  // Sheet 5: Failed Transactions
+  const failedTxRows: any[] = [];
+  failedTxRows.push(['Voucher Date', 'Voucher Number', 'Voucher Type', 'Reason for Failure / Skip']);
+  if (daybookSummary && daybookSummary.failures) {
+    daybookSummary.failures.forEach(f => {
+      failedTxRows.push([f.date, f.voucherNo, f.voucherType, f.reason]);
+    });
+  }
+  const failedTxWs = XLSX.utils.aoa_to_sheet(failedTxRows);
+  XLSX.utils.book_append_sheet(wb, failedTxWs, 'Failed Transactions');
+  
+  XLSX.writeFile(wb, `Tally_Fetch_Report_${Date.now()}.xlsx`);
 }

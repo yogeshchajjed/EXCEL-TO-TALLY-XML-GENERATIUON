@@ -22,6 +22,9 @@ export interface ElectronAPI {
     fetchUnits: (config: ElectronTallyConfig, xml: string) => Promise<ElectronTallyResponse>;
     fetchDaybook: (config: ElectronTallyConfig, xml: string) => Promise<ElectronTallyResponse>;
     pushXml: (config: ElectronTallyConfig, xml: string) => Promise<ElectronTallyResponse>;
+    fetchCompanies: (config: ElectronTallyConfig, xml: string) => Promise<ElectronTallyResponse>;
+    fetchMastersForCompany: (config: ElectronTallyConfig, xml: string) => Promise<ElectronTallyResponse>;
+    fetchDaybookForCompany: (config: ElectronTallyConfig, xml: string) => Promise<ElectronTallyResponse>;
   };
 }
 

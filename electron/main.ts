@@ -131,7 +131,10 @@ const tallyChannels = [
   'tally:fetchStockItems',
   'tally:fetchUnits',
   'tally:fetchDaybook',
-  'tally:pushXml'
+  'tally:pushXml',
+  'tally:fetchCompanies',
+  'tally:fetchMastersForCompany',
+  'tally:fetchDaybookForCompany'
 ];
 
 for (const channel of tallyChannels) {

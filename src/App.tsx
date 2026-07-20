@@ -42,7 +42,13 @@ import {
   fetchTallyMasters, 
   fetchTallyDaybook, 
   pushXmlToTally, 
-  parseTallyResponse 
+  parseTallyResponse,
+  fetchCompaniesFromTally,
+  fetchMastersForCompany,
+  fetchDaybookForCompany,
+  generateFetchReportExcel,
+  type MastersFetchSummary,
+  type DaybookFetchSummary
 } from './lib/tallyConnector';
 import { 
   FileSpreadsheet, 
@@ -641,6 +647,12 @@ export default function App() {
   const [tallyCompany, setTallyCompany] = useState('');
   const [tallyFromDate, setTallyFromDate] = useState('2026-04-01');
   const [tallyToDate, setTallyToDate] = useState('2026-07-19');
+  const [tallyCompanies, setTallyCompanies] = useState<{ name: string; guid: string; isActive: boolean }[]>([]);
+  const [selectedTallyCompany, setSelectedTallyCompany] = useState<string>('');
+  const [mastersSummary, setMastersSummary] = useState<MastersFetchSummary | null>(null);
+  const [daybookSummary, setDaybookSummary] = useState<DaybookFetchSummary | null>(null);
+  const [detailedParsedMasters, setDetailedParsedMasters] = useState<any | null>(null);
+  const [detailedParsedTransactions, setDetailedParsedTransactions] = useState<any[] | null>(null);
   const [recentPushLogs, setRecentPushLogs] = useState<TallyPushLog[]>([]);
   const [isPushModalOpen, setIsPushModalOpen] = useState(false);
   const [pushModalData, setPushModalData] = useState<{
@@ -673,25 +685,45 @@ export default function App() {
     setTallyStatus('Connecting');
     setTallyError('');
     setTallyCompany('');
+    setTallyCompanies([]);
+    setSelectedTallyCompany('');
+    setMastersSummary(null);
+    setDaybookSummary(null);
+    setDetailedParsedMasters(null);
+    setDetailedParsedTransactions(null);
+
     try {
       const config = { host: tallyHost, port: tallyPort };
       const res = await testTallyConnection(config);
       if (res.success) {
-        setTallyStatus('Connected');
-        const summary = parseTallyResponse(res.response || '');
-        if (summary.companyName) {
-          setTallyCompany(summary.companyName);
-        } else {
-          const compRes = await fetchTallyCompany(config);
-          if (compRes.success) {
-            const compSummary = parseTallyResponse(compRes.response || '');
-            if (compSummary.companyName) {
-              setTallyCompany(compSummary.companyName);
-            } else {
-              setTallyCompany('Active Company Detected');
-            }
+        try {
+          const fetchedComps = await fetchCompaniesFromTally(config);
+          if (fetchedComps && fetchedComps.length > 0) {
+            setTallyStatus('Connected');
+            setTallyCompanies(fetchedComps);
+            // If only one company is detected, auto-select it but still show actual name
+            const firstComp = fetchedComps[0].name;
+            setSelectedTallyCompany(firstComp);
+            setTallyCompany(firstComp);
           } else {
-            setTallyCompany('Active Company Detected');
+            setTallyStatus('Error');
+            setTallyError("No active company detected. Please open company in TallyPrime.");
+            setTallyCompanies([]);
+            setSelectedTallyCompany('');
+            setTallyCompany('');
+          }
+        } catch (compErr: any) {
+          console.error("Failed to fetch companies from Tally during connect", compErr);
+          const summary = parseTallyResponse(res.response || '');
+          if (summary.companyName && summary.companyName !== 'Active Company Detected') {
+            setTallyStatus('Connected');
+            const fallbackComp = { name: summary.companyName, guid: '', isActive: true };
+            setTallyCompanies([fallbackComp]);
+            setSelectedTallyCompany(summary.companyName);
+            setTallyCompany(summary.companyName);
+          } else {
+            setTallyStatus('Error');
+            setTallyError("No active company detected. Please open company in TallyPrime.");
           }
         }
       } else {
@@ -708,6 +740,12 @@ export default function App() {
     setTallyStatus('Disconnected');
     setTallyError('');
     setTallyCompany('');
+    setTallyCompanies([]);
+    setSelectedTallyCompany('');
+    setMastersSummary(null);
+    setDaybookSummary(null);
+    setDetailedParsedMasters(null);
+    setDetailedParsedTransactions(null);
   };
 
   const handleFetchMasters = async () => {
@@ -715,12 +753,21 @@ export default function App() {
       setError('Please connect to Tally first.');
       return;
     }
+    if (!selectedTallyCompany) {
+      setError('No active company selected. Please select a company.');
+      return;
+    }
     if (!user) return;
     setIsContextLoading(true);
     setError(null);
+    setMastersSummary(null);
     try {
       const config = { host: tallyHost, port: tallyPort };
-      const parsed = await fetchTallyMasters(config);
+      const parsedData = await fetchMastersForCompany(config, selectedTallyCompany);
+      
+      const parsed = parsedData.parsedMasters;
+      setMastersSummary(parsedData.summary);
+      setDetailedParsedMasters(parsed);
       
       const existingMappings = tallyContext?.historicalMappings || [];
       const contextPayload: any = {
@@ -755,12 +802,21 @@ export default function App() {
       setError('Please connect to Tally first.');
       return;
     }
+    if (!selectedTallyCompany) {
+      setError('No active company selected. Please select a company.');
+      return;
+    }
     if (!user) return;
     setIsContextLoading(true);
     setError(null);
+    setDaybookSummary(null);
     try {
       const config = { host: tallyHost, port: tallyPort };
-      const txs = await fetchTallyDaybook(config, tallyFromDate, tallyToDate);
+      const parsedData = await fetchDaybookForCompany(config, selectedTallyCompany, tallyFromDate, tallyToDate);
+      
+      const txs = parsedData.transactions;
+      setDaybookSummary(parsedData.summary);
+      setDetailedParsedTransactions(txs);
       
       const ledgerNamesFromEntries: string[] = [];
       const historicalMappings: { narration: string; ledger: string }[] = [];
@@ -6488,11 +6544,40 @@ export default function App() {
                                       </span>
                                     </div>
 
-                                    {tallyCompany && (
-                                      <div className="flex items-center gap-2 text-xs">
-                                        <Building className="w-3.5 h-3.5 text-zinc-400" />
-                                        <span className="font-semibold text-zinc-600">Company:</span>
-                                        <span className="font-bold text-emerald-700">{tallyCompany}</span>
+                                    {tallyStatus === 'Connected' && (
+                                      <div className="flex flex-col gap-2 w-full pt-2">
+                                        {tallyCompanies.length === 0 ? (
+                                          <div className="text-xs text-rose-600 font-bold bg-rose-50 border border-rose-100 rounded-lg p-2.5 flex items-center gap-2">
+                                            <AlertCircle className="w-4 h-4 shrink-0" />
+                                            <span>No active company detected. Please open company in TallyPrime.</span>
+                                          </div>
+                                        ) : tallyCompanies.length === 1 ? (
+                                          <div className="flex items-center gap-2 text-xs">
+                                            <Building className="w-3.5 h-3.5 text-zinc-400" />
+                                            <span className="font-semibold text-zinc-600">Company:</span>
+                                            <span className="font-bold text-emerald-700 bg-emerald-50 border border-emerald-100 px-2 py-1 rounded-md">{selectedTallyCompany}</span>
+                                          </div>
+                                        ) : (
+                                          <div className="flex items-center gap-3 text-xs">
+                                            <Building className="w-3.5 h-3.5 text-zinc-400" />
+                                            <span className="font-semibold text-zinc-600 shrink-0">Select Company ({tallyCompanies.length} open):</span>
+                                            <select
+                                              value={selectedTallyCompany}
+                                              onChange={(e) => {
+                                                const val = e.target.value;
+                                                setSelectedTallyCompany(val);
+                                                setTallyCompany(val);
+                                              }}
+                                              className="bg-white border border-zinc-200 text-zinc-900 text-xs font-bold rounded-lg px-2.5 py-1 focus:outline-none focus:ring-1 focus:ring-emerald-500 max-w-xs cursor-pointer"
+                                            >
+                                              {tallyCompanies.map((c) => (
+                                                <option key={c.name} value={c.name}>
+                                                  {c.name} {c.isActive ? '(Active)' : ''}
+                                                </option>
+                                              ))}
+                                            </select>
+                                          </div>
+                                        )}
                                       </div>
                                     )}
 
@@ -6566,6 +6651,135 @@ export default function App() {
                                       </>
                                     )}
                                   </div>
+
+                                  {/* Detailed Fetch Summaries */}
+                                  {(mastersSummary || daybookSummary) && (
+                                    <div className="bg-white border border-zinc-200 rounded-2xl p-5 space-y-5 mt-4">
+                                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-zinc-100 pb-3">
+                                        <h4 className="font-bold text-zinc-900 text-sm flex items-center gap-2">
+                                          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                                          Data Fetch & Import Report
+                                        </h4>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            generateFetchReportExcel(
+                                              mastersSummary,
+                                              daybookSummary,
+                                              detailedParsedMasters,
+                                              detailedParsedTransactions
+                                            );
+                                          }}
+                                          className="px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-[11px] font-bold transition-all flex items-center gap-1.5 self-start sm:self-center"
+                                        >
+                                          <Download className="w-3.5 h-3.5" />
+                                          Download Fetch Report Excel
+                                        </button>
+                                      </div>
+
+                                      {/* Masters Fetch Summary */}
+                                      {mastersSummary && (
+                                        <div className="space-y-3">
+                                          <div className="flex items-center gap-2 text-xs font-bold text-zinc-700">
+                                            <Database className="w-4 h-4 text-zinc-500" />
+                                            <span>Masters Import Summary</span>
+                                          </div>
+                                          
+                                          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+                                            {[
+                                              { label: 'Ledgers', summary: mastersSummary.ledgers },
+                                              { label: 'Groups', summary: mastersSummary.groups },
+                                              { label: 'Stock Items', summary: mastersSummary.stockItems },
+                                              { label: 'Units', summary: mastersSummary.units },
+                                              { label: 'Voucher Types', summary: mastersSummary.voucherTypes },
+                                            ].map((item, idx) => (
+                                              <div key={idx} className="p-2.5 bg-zinc-50 border border-zinc-200/60 rounded-xl space-y-1">
+                                                <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider">{item.label}</p>
+                                                <div className="flex items-baseline justify-between text-zinc-900">
+                                                  <span className="text-xs font-semibold">Total: <span className="font-bold">{item.summary.total}</span></span>
+                                                </div>
+                                                <div className="text-[10px] text-zinc-500 space-y-0.5 font-mono">
+                                                  <p className="text-emerald-600 font-bold">Fetched: {item.summary.fetched}</p>
+                                                  <p className={item.summary.failed > 0 ? "text-rose-600 font-bold" : "text-zinc-400"}>Skipped: {item.summary.failed}</p>
+                                                </div>
+                                              </div>
+                                            ))}
+                                          </div>
+
+                                          {/* Masters Skip Reasons */}
+                                          {mastersSummary.failures.length > 0 && (
+                                            <div className="border border-rose-100 bg-rose-50/20 rounded-xl p-3 space-y-2">
+                                              <p className="text-[11px] font-bold text-rose-800 flex items-center gap-1">
+                                                <AlertCircle className="w-3.5 h-3.5 text-rose-600" />
+                                                Skipped / Not Fetched Masters Reasons:
+                                              </p>
+                                              <div className="max-h-24 overflow-y-auto space-y-1 font-mono text-[10px] text-rose-700 divide-y divide-rose-100/50">
+                                                {mastersSummary.failures.slice(0, 15).map((f, fIdx) => (
+                                                  <div key={fIdx} className="py-1 flex justify-between gap-4">
+                                                    <span>[{f.type}] <span className="font-bold">{f.name}</span></span>
+                                                    <span className="text-right italic shrink-0">{f.reason}</span>
+                                                  </div>
+                                                ))}
+                                                {mastersSummary.failures.length > 15 && (
+                                                  <div className="py-1 text-center font-sans text-zinc-400 text-[10px]">
+                                                    And {mastersSummary.failures.length - 15} more... Download the full Excel report for the complete log.
+                                                  </div>
+                                                )}
+                                              </div>
+                                            </div>
+                                          )}
+                                        </div>
+                                      )}
+
+                                      {/* Daybook Fetch Summary */}
+                                      {daybookSummary && (
+                                        <div className="space-y-3 pt-3 border-t border-zinc-100">
+                                          <div className="flex items-center gap-2 text-xs font-bold text-zinc-700">
+                                            <FileText className="w-4 h-4 text-zinc-500" />
+                                            <span>Daybook Import Summary</span>
+                                          </div>
+
+                                          <div className="bg-zinc-50 border border-zinc-200/60 rounded-xl p-3 grid grid-cols-3 gap-4 text-center">
+                                            <div>
+                                              <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider mb-0.5">Total Vouchers</p>
+                                              <p className="text-base font-black text-zinc-800">{daybookSummary.total}</p>
+                                            </div>
+                                            <div>
+                                              <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider mb-0.5">Successfully Fetched</p>
+                                              <p className="text-base font-black text-emerald-600">{daybookSummary.fetched}</p>
+                                            </div>
+                                            <div>
+                                              <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider mb-0.5">Skipped / Ignored</p>
+                                              <p className={`text-base font-black ${daybookSummary.failed > 0 ? 'text-rose-600' : 'text-zinc-400'}`}>{daybookSummary.failed}</p>
+                                            </div>
+                                          </div>
+
+                                          {/* Daybook Failures Reasons */}
+                                          {daybookSummary.failures.length > 0 && (
+                                            <div className="border border-rose-100 bg-rose-50/20 rounded-xl p-3 space-y-2">
+                                              <p className="text-[11px] font-bold text-rose-800 flex items-center gap-1">
+                                                <AlertCircle className="w-3.5 h-3.5 text-rose-600" />
+                                                Skipped / Not Fetched Transactions Reasons:
+                                              </p>
+                                              <div className="max-h-24 overflow-y-auto space-y-1 font-mono text-[10px] text-rose-700 divide-y divide-rose-100/50">
+                                                {daybookSummary.failures.slice(0, 15).map((f, fIdx) => (
+                                                  <div key={fIdx} className="py-1 flex justify-between gap-4">
+                                                    <span>{f.date} | No: <span className="font-bold">{f.voucherNo || 'N/A'}</span> ({f.type})</span>
+                                                    <span className="text-right italic shrink-0">{f.reason}</span>
+                                                  </div>
+                                                ))}
+                                                {daybookSummary.failures.length > 15 && (
+                                                  <div className="py-1 text-center font-sans text-zinc-400 text-[10px]">
+                                                    And {daybookSummary.failures.length - 15} more... Download the full Excel report for the complete log.
+                                                  </div>
+                                                )}
+                                              </div>
+                                            </div>
+                                          )}
+                                        </div>
+                                      )}
+                                    </div>
+                                  )}
 
                                   {/* Helper note */}
                                   <p className="text-[11px] text-zinc-400 leading-relaxed italic">
