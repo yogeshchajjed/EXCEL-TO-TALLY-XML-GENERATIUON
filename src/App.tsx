@@ -653,6 +653,9 @@ export default function App() {
   const [daybookSummary, setDaybookSummary] = useState<DaybookFetchSummary | null>(null);
   const [detailedParsedMasters, setDetailedParsedMasters] = useState<any | null>(null);
   const [detailedParsedTransactions, setDetailedParsedTransactions] = useState<any[] | null>(null);
+  const [tallyFetchMergeMode, setTallyFetchMergeMode] = useState<'merge' | 'replace'>('merge');
+  const [lastFetchType, setLastFetchType] = useState<'masters' | 'daybook' | 'combined' | null>(null);
+  const [isTallyDrawerOpen, setIsTallyDrawerOpen] = useState(false);
   const [recentPushLogs, setRecentPushLogs] = useState<TallyPushLog[]>([]);
   const [isPushModalOpen, setIsPushModalOpen] = useState(false);
   const [pushModalData, setPushModalData] = useState<{
@@ -748,130 +751,239 @@ export default function App() {
     setDetailedParsedTransactions(null);
   };
 
-  const handleFetchMasters = async () => {
+  const handleTallyFetch = async (mode: 'masters' | 'daybook' | 'combined') => {
     if (tallyStatus !== 'Connected') {
       setError('Please connect to Tally first.');
       return;
     }
     if (!selectedTallyCompany) {
-      setError('No active company selected. Please select a company.');
+      setError('Please select Tally company before fetching data.');
       return;
     }
     if (!user) return;
     setIsContextLoading(true);
     setError(null);
-    setMastersSummary(null);
+    setLastFetchType(mode);
+
+    // Initialize/clear if replacing, otherwise preserve
+    if (tallyFetchMergeMode === 'replace') {
+      setMastersSummary(null);
+      setDaybookSummary(null);
+      setDetailedParsedMasters(null);
+      setDetailedParsedTransactions(null);
+    }
+
     try {
       const config = { host: tallyHost, port: tallyPort };
-      const parsedData = await fetchMastersForCompany(config, selectedTallyCompany);
       
-      const parsed = parsedData.parsedMasters;
-      setMastersSummary(parsedData.summary);
-      setDetailedParsedMasters(parsed);
-      
-      const existingMappings = tallyContext?.historicalMappings || [];
-      const contextPayload: any = {
-        uid: user.uid,
-        ledgers: Array.from(new Set(parsed.ledgers)),
-        groups: Array.from(new Set(parsed.groups)),
-        stockGroups: Array.from(new Set(parsed.stockGroups)),
-        stockItems: Array.from(new Set(parsed.stockItems)),
-        units: Array.from(new Set(parsed.units)),
-        ledgerGroupMap: parsed.ledgerGroupMap,
-        stockItemStockGroupMap: parsed.stockItemStockGroupMap,
-        groupParentMap: parsed.groupParentMap || {},
-        historicalMappings: existingMappings,
-        ledgerDetails: parsed.ledgerDetails || [],
-        stockItemDetails: parsed.stockItemDetails || [],
-      };
-      
-      if (getAppMode() === 'web') {
-        contextPayload.lastUpdated = serverTimestamp();
+      let mastersData: any = null;
+      let daybookData: any = null;
+
+      // 1. Fetch Masters if requested
+      if (mode === 'masters' || mode === 'combined') {
+        const parsedData = await fetchMastersForCompany(config, selectedTallyCompany);
+        mastersData = parsedData;
       }
-      await saveTallyContext(user.uid, contextPayload);
-      setIsContextLoading(false);
-    } catch (err: any) {
-      console.error("Failed to fetch Tally masters", err);
-      setError(err.message || "Failed to fetch masters from local Tally.");
-      setIsContextLoading(false);
-    }
-  };
 
-  const handleFetchDaybook = async () => {
-    if (tallyStatus !== 'Connected') {
-      setError('Please connect to Tally first.');
-      return;
-    }
-    if (!selectedTallyCompany) {
-      setError('No active company selected. Please select a company.');
-      return;
-    }
-    if (!user) return;
-    setIsContextLoading(true);
-    setError(null);
-    setDaybookSummary(null);
-    try {
-      const config = { host: tallyHost, port: tallyPort };
-      const parsedData = await fetchDaybookForCompany(config, selectedTallyCompany, tallyFromDate, tallyToDate);
-      
-      const txs = parsedData.transactions;
-      setDaybookSummary(parsedData.summary);
-      setDetailedParsedTransactions(txs);
-      
-      const ledgerNamesFromEntries: string[] = [];
-      const historicalMappings: { narration: string; ledger: string }[] = [];
+      // 2. Fetch Daybook if requested
+      if (mode === 'daybook' || mode === 'combined') {
+        const parsedData = await fetchDaybookForCompany(config, selectedTallyCompany, tallyFromDate, tallyToDate);
+        daybookData = parsedData;
+      }
 
-      txs.forEach((tx) => {
-        if (tx.ledger) {
-          ledgerNamesFromEntries.push(tx.ledger);
+      // 3. Process & Save to State
+      let newMastersSummary = tallyFetchMergeMode === 'merge' ? mastersSummary : null;
+      let newDaybookSummary = tallyFetchMergeMode === 'merge' ? daybookSummary : null;
+      let newDetailedMasters = tallyFetchMergeMode === 'merge' ? detailedParsedMasters : null;
+      let newDetailedTransactions = tallyFetchMergeMode === 'merge' ? (detailedParsedTransactions || []) : [];
+
+      if (mastersData) {
+        newMastersSummary = mastersData.summary;
+        newDetailedMasters = mastersData.parsedMasters;
+      }
+
+      if (daybookData) {
+        newDaybookSummary = daybookData.summary;
+        if (tallyFetchMergeMode === 'merge') {
+          // If merging daybook, merge transactions, ensuring uniqueness
+          const existingTxs = newDetailedTransactions || [];
+          const newTxs = daybookData.transactions;
+          
+          const mergedTxs = [...existingTxs];
+          newTxs.forEach((tx: any) => {
+            const isDuplicate = mergedTxs.some(etx => 
+              etx.date === tx.date &&
+              etx.voucherType === tx.voucherType &&
+              etx.ledger === tx.ledger &&
+              etx.amount === tx.amount &&
+              etx.reference === tx.reference
+            );
+            if (!isDuplicate) {
+              mergedTxs.push(tx);
+            }
+          });
+          newDetailedTransactions = mergedTxs;
+        } else {
+          newDetailedTransactions = daybookData.transactions;
         }
-        if (tx.narration && tx.ledger) {
-          const lLower = tx.ledger.toLowerCase();
-          if (!lLower.includes('bank') && !lLower.includes('cash')) {
-            historicalMappings.push({ narration: tx.narration, ledger: tx.ledger });
+      }
+
+      // Set summaries and detailed parsed data
+      if (newMastersSummary) setMastersSummary(newMastersSummary);
+      if (newDaybookSummary) setDaybookSummary(newDaybookSummary);
+      if (newDetailedMasters) setDetailedParsedMasters(newDetailedMasters);
+      setDetailedParsedTransactions(newDetailedTransactions);
+
+      // 4. Build context payload and save to IndexedDB
+      const currentContext = tallyContext || {};
+      const existingMappings = currentContext.historicalMappings || [];
+
+      // Ledgers
+      let mergedLedgers = currentContext.ledgers || [];
+      if (newDetailedMasters?.ledgers) {
+        mergedLedgers = tallyFetchMergeMode === 'merge'
+          ? Array.from(new Set([...mergedLedgers, ...newDetailedMasters.ledgers]))
+          : Array.from(new Set(newDetailedMasters.ledgers));
+      }
+
+      // Add ledgers from daybook transactions as well
+      if (newDetailedTransactions && newDetailedTransactions.length > 0) {
+        const txLedgers = newDetailedTransactions.map((t: any) => t.ledger).filter(Boolean);
+        mergedLedgers = Array.from(new Set([...mergedLedgers, ...txLedgers]));
+      }
+
+      // Groups
+      let mergedGroups = currentContext.groups || [];
+      if (newDetailedMasters?.groups) {
+        mergedGroups = tallyFetchMergeMode === 'merge'
+          ? Array.from(new Set([...mergedGroups, ...newDetailedMasters.groups]))
+          : Array.from(new Set(newDetailedMasters.groups));
+      }
+
+      // Stock Groups
+      let mergedStockGroups = currentContext.stockGroups || [];
+      if (newDetailedMasters?.stockGroups) {
+        mergedStockGroups = tallyFetchMergeMode === 'merge'
+          ? Array.from(new Set([...mergedStockGroups, ...newDetailedMasters.stockGroups]))
+          : Array.from(new Set(newDetailedMasters.stockGroups));
+      }
+
+      // Stock Items
+      let mergedStockItems = currentContext.stockItems || [];
+      if (newDetailedMasters?.stockItems) {
+        mergedStockItems = tallyFetchMergeMode === 'merge'
+          ? Array.from(new Set([...mergedStockItems, ...newDetailedMasters.stockItems]))
+          : Array.from(new Set(newDetailedMasters.stockItems));
+      }
+
+      // Units
+      let mergedUnits = currentContext.units || [];
+      if (newDetailedMasters?.units) {
+        mergedUnits = tallyFetchMergeMode === 'merge'
+          ? Array.from(new Set([...mergedUnits, ...newDetailedMasters.units]))
+          : Array.from(new Set(newDetailedMasters.units));
+      }
+
+      // Ledger Group Map
+      let mergedLedgerGroupMap = { ...(currentContext.ledgerGroupMap || {}) };
+      if (newDetailedMasters?.ledgerGroupMap) {
+        mergedLedgerGroupMap = tallyFetchMergeMode === 'merge'
+          ? { ...mergedLedgerGroupMap, ...newDetailedMasters.ledgerGroupMap }
+          : { ...newDetailedMasters.ledgerGroupMap };
+      }
+
+      // Stock Item Stock Group Map
+      let mergedStockItemStockGroupMap = { ...(currentContext.stockItemStockGroupMap || {}) };
+      if (newDetailedMasters?.stockItemStockGroupMap) {
+        mergedStockItemStockGroupMap = tallyFetchMergeMode === 'merge'
+          ? { ...mergedStockItemStockGroupMap, ...newDetailedMasters.stockItemStockGroupMap }
+          : { ...newDetailedMasters.stockItemStockGroupMap };
+      }
+
+      // Group Parent Map
+      let mergedGroupParentMap = { ...(currentContext.groupParentMap || {}) };
+      if (newDetailedMasters?.groupParentMap) {
+        mergedGroupParentMap = tallyFetchMergeMode === 'merge'
+          ? { ...mergedGroupParentMap, ...newDetailedMasters.groupParentMap }
+          : { ...newDetailedMasters.groupParentMap };
+      }
+
+      // Historical mappings
+      let historicalMappings: { narration: string; ledger: string }[] = [];
+      if (newDetailedTransactions && newDetailedTransactions.length > 0) {
+        newDetailedTransactions.forEach((tx: any) => {
+          if (tx.narration && tx.ledger) {
+            const lLower = tx.ledger.toLowerCase();
+            if (!lLower.includes('bank') && !lLower.includes('cash')) {
+              historicalMappings.push({ narration: tx.narration, ledger: tx.ledger });
+            }
           }
+        });
+      }
+      let mergedHistorical = tallyFetchMergeMode === 'merge'
+        ? [...existingMappings, ...historicalMappings]
+        : historicalMappings;
+      mergedHistorical = mergedHistorical.slice(0, 500);
+
+      // Ledger Details
+      let mergedLedgerDetails = currentContext.ledgerDetails || [];
+      if (newDetailedMasters?.ledgerDetails) {
+        if (tallyFetchMergeMode === 'merge') {
+          const detailMap = new Map();
+          mergedLedgerDetails.forEach((d: any) => detailMap.set(d.ledgerName, d));
+          newDetailedMasters.ledgerDetails.forEach((d: any) => detailMap.set(d.ledgerName, d));
+          mergedLedgerDetails = Array.from(detailMap.values());
+        } else {
+          mergedLedgerDetails = newDetailedMasters.ledgerDetails;
         }
-      });
+      }
 
-      const currentLedgers = tallyContext?.ledgers || [];
-      const mergedLedgers = Array.from(new Set([...currentLedgers, ...ledgerNamesFromEntries]));
-
-      const currentGroups = tallyContext?.groups || [];
-      const currentStockGroups = tallyContext?.stockGroups || [];
-      const currentStockItems = tallyContext?.stockItems || [];
-      const currentUnits = tallyContext?.units || [];
-      const currentLedgerGroupMap = tallyContext?.ledgerGroupMap || {};
-      const currentStockItemStockGroupMap = tallyContext?.stockItemStockGroupMap || {};
-      const currentGroupParentMap = tallyContext?.groupParentMap || {};
-      const currentHistorical = tallyContext?.historicalMappings || [];
-      
-      const mergedHistorical = [...currentHistorical, ...historicalMappings].slice(0, 500);
+      // Stock Item Details
+      let mergedStockItemDetails = currentContext.stockItemDetails || [];
+      if (newDetailedMasters?.stockItemDetails) {
+        if (tallyFetchMergeMode === 'merge') {
+          const detailMap = new Map();
+          mergedStockItemDetails.forEach((d: any) => detailMap.set(d.itemName, d));
+          newDetailedMasters.stockItemDetails.forEach((d: any) => detailMap.set(d.itemName, d));
+          mergedStockItemDetails = Array.from(detailMap.values());
+        } else {
+          mergedStockItemDetails = newDetailedMasters.stockItemDetails;
+        }
+      }
 
       const contextPayload: any = {
         uid: user.uid,
         ledgers: mergedLedgers,
-        groups: currentGroups,
-        stockGroups: currentStockGroups,
-        stockItems: currentStockItems,
-        units: currentUnits,
-        ledgerGroupMap: currentLedgerGroupMap,
-        stockItemStockGroupMap: currentStockItemStockGroupMap,
-        groupParentMap: currentGroupParentMap,
+        groups: mergedGroups,
+        stockGroups: mergedStockGroups,
+        stockItems: mergedStockItems,
+        units: mergedUnits,
+        ledgerGroupMap: mergedLedgerGroupMap,
+        stockItemStockGroupMap: mergedStockItemStockGroupMap,
+        groupParentMap: mergedGroupParentMap,
         historicalMappings: mergedHistorical,
-        ledgerDetails: tallyContext?.ledgerDetails || [],
-        stockItemDetails: tallyContext?.stockItemDetails || [],
+        ledgerDetails: mergedLedgerDetails,
+        stockItemDetails: mergedStockItemDetails,
       };
-      
+
       if (getAppMode() === 'web') {
         contextPayload.lastUpdated = serverTimestamp();
       }
       await saveTallyContext(user.uid, contextPayload);
       setIsContextLoading(false);
     } catch (err: any) {
-      console.error("Failed to fetch Tally Daybook", err);
-      setError(err.message || "Failed to fetch Daybook transactions from local Tally.");
+      console.error("Failed to fetch Tally data", err);
+      setError(err.message || "Failed to fetch data from local Tally.");
       setIsContextLoading(false);
     }
+  };
+
+  const handleFetchMasters = async () => {
+    await handleTallyFetch('masters');
+  };
+
+  const handleFetchDaybook = async () => {
+    await handleTallyFetch('daybook');
   };
 
   const initiateTallyPush = (
@@ -6530,59 +6642,110 @@ export default function App() {
                                   </div>
 
                                   {/* Connection Status Indicator */}
-                                  <div className="flex flex-wrap items-center gap-4 py-2 border-t border-b border-zinc-200/60">
-                                    <div className="flex items-center gap-2">
-                                      <span className="text-xs font-semibold text-zinc-500">Status:</span>
-                                      <span className={`inline-flex items-center gap-1.5 text-xs font-bold px-2.5 py-1 rounded-full ${
-                                        tallyStatus === 'Connected' ? 'bg-emerald-100 text-emerald-800' :
-                                        tallyStatus === 'Connecting' ? 'bg-blue-100 text-blue-800' :
-                                        tallyStatus === 'Error' ? 'bg-rose-100 text-rose-800' :
-                                        'bg-zinc-200 text-zinc-700'
-                                      }`}>
-                                        {tallyStatus === 'Connecting' && <Loader2 className="w-3 h-3 animate-spin" />}
-                                        {tallyStatus}
-                                      </span>
+                                  <div className="flex flex-col gap-4 py-3 border-t border-b border-zinc-200/60">
+                                    <div className="flex items-center justify-between gap-4">
+                                      <div className="flex items-center gap-2">
+                                        <span className="text-xs font-semibold text-zinc-500">Status:</span>
+                                        <span className={`inline-flex items-center gap-1.5 text-xs font-bold px-2.5 py-1 rounded-full ${
+                                          tallyStatus === 'Connected' ? 'bg-emerald-100 text-emerald-800' :
+                                          tallyStatus === 'Connecting' ? 'bg-blue-100 text-blue-800' :
+                                          tallyStatus === 'Error' ? 'bg-rose-100 text-rose-800' :
+                                          'bg-zinc-200 text-zinc-700'
+                                        }`}>
+                                          {tallyStatus === 'Connecting' && <Loader2 className="w-3 h-3 animate-spin" />}
+                                          {tallyStatus}
+                                        </span>
+                                      </div>
+
+                                      {tallyStatus === 'Connected' && (
+                                        <button
+                                          type="button"
+                                          onClick={handleDisconnect}
+                                          className="flex items-center gap-1 px-2.5 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 font-bold text-[10px] rounded-lg transition-colors"
+                                        >
+                                          <X className="w-3 h-3" />
+                                          Disconnect
+                                        </button>
+                                      )}
                                     </div>
 
                                     {tallyStatus === 'Connected' && (
-                                      <div className="flex flex-col gap-2 w-full pt-2">
-                                        {tallyCompanies.length === 0 ? (
-                                          <div className="text-xs text-rose-600 font-bold bg-rose-50 border border-rose-100 rounded-lg p-2.5 flex items-center gap-2">
-                                            <AlertCircle className="w-4 h-4 shrink-0" />
-                                            <span>No active company detected. Please open company in TallyPrime.</span>
+                                      <div className="space-y-4">
+                                        {/* Company Dropdown / Selector */}
+                                        <div>
+                                          <label className="block text-[10px] font-bold text-zinc-500 uppercase tracking-wider mb-1.5">
+                                            Active Tally Company Name
+                                          </label>
+                                          {tallyCompanies.length === 0 ? (
+                                            <div className="text-xs text-rose-600 font-bold bg-rose-50 border border-rose-100 rounded-lg p-2.5 flex items-center gap-2">
+                                              <AlertCircle className="w-4 h-4 shrink-0" />
+                                              <span>No active company detected. Please open company in TallyPrime.</span>
+                                            </div>
+                                          ) : (
+                                            <div className="flex items-center gap-2">
+                                              <Building className="w-4 h-4 text-zinc-400 shrink-0" />
+                                              <select
+                                                value={selectedTallyCompany}
+                                                onChange={(e) => {
+                                                  const val = e.target.value;
+                                                  if (selectedTallyCompany && selectedTallyCompany !== val) {
+                                                    const proceed = window.confirm("You are changing the selected company. Do you want to replace the existing fetched context or keep separate company-wise data?\n\nClick OK to REPLACE, or Cancel to KEEP (Merge mode).");
+                                                    if (proceed) {
+                                                      setTallyFetchMergeMode('replace');
+                                                    } else {
+                                                      setTallyFetchMergeMode('merge');
+                                                    }
+                                                  }
+                                                  setSelectedTallyCompany(val);
+                                                  setTallyCompany(val);
+                                                }}
+                                                className="w-full max-w-md bg-white border border-zinc-200 text-zinc-900 text-xs font-bold rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-emerald-500 cursor-pointer"
+                                              >
+                                                {tallyCompanies.map((c) => (
+                                                  <option key={c.name} value={c.name}>
+                                                    {c.name} {c.isActive ? '(Active)' : ''}
+                                                  </option>
+                                                ))}
+                                              </select>
+                                            </div>
+                                          )}
+                                        </div>
+
+                                        {/* Merge / Replace Mode Selector */}
+                                        <div className="bg-zinc-100/60 rounded-xl p-3 border border-zinc-200/40 space-y-2 max-w-md">
+                                          <span className="block text-[10px] font-bold text-zinc-500 uppercase tracking-wider">
+                                            Import State Preference
+                                          </span>
+                                          <div className="flex flex-col sm:flex-row gap-3 text-xs">
+                                            <label className="flex items-center gap-1.5 font-semibold text-zinc-700 cursor-pointer">
+                                              <input 
+                                                type="radio" 
+                                                name="tallyMergeMode" 
+                                                value="merge" 
+                                                checked={tallyFetchMergeMode === 'merge'} 
+                                                onChange={() => setTallyFetchMergeMode('merge')}
+                                                className="text-emerald-600 focus:ring-emerald-500"
+                                              />
+                                              Merge with existing context (Default)
+                                            </label>
+                                            <label className="flex items-center gap-1.5 font-semibold text-zinc-700 cursor-pointer">
+                                              <input 
+                                                type="radio" 
+                                                name="tallyMergeMode" 
+                                                value="replace" 
+                                                checked={tallyFetchMergeMode === 'replace'} 
+                                                onChange={() => setTallyFetchMergeMode('replace')}
+                                                className="text-emerald-600 focus:ring-emerald-500"
+                                              />
+                                              Replace existing context
+                                            </label>
                                           </div>
-                                        ) : tallyCompanies.length === 1 ? (
-                                          <div className="flex items-center gap-2 text-xs">
-                                            <Building className="w-3.5 h-3.5 text-zinc-400" />
-                                            <span className="font-semibold text-zinc-600">Company:</span>
-                                            <span className="font-bold text-emerald-700 bg-emerald-50 border border-emerald-100 px-2 py-1 rounded-md">{selectedTallyCompany}</span>
-                                          </div>
-                                        ) : (
-                                          <div className="flex items-center gap-3 text-xs">
-                                            <Building className="w-3.5 h-3.5 text-zinc-400" />
-                                            <span className="font-semibold text-zinc-600 shrink-0">Select Company ({tallyCompanies.length} open):</span>
-                                            <select
-                                              value={selectedTallyCompany}
-                                              onChange={(e) => {
-                                                const val = e.target.value;
-                                                setSelectedTallyCompany(val);
-                                                setTallyCompany(val);
-                                              }}
-                                              className="bg-white border border-zinc-200 text-zinc-900 text-xs font-bold rounded-lg px-2.5 py-1 focus:outline-none focus:ring-1 focus:ring-emerald-500 max-w-xs cursor-pointer"
-                                            >
-                                              {tallyCompanies.map((c) => (
-                                                <option key={c.name} value={c.name}>
-                                                  {c.name} {c.isActive ? '(Active)' : ''}
-                                                </option>
-                                              ))}
-                                            </select>
-                                          </div>
-                                        )}
+                                        </div>
                                       </div>
                                     )}
 
                                     {tallyError && (
-                                      <div className="text-xs font-medium text-rose-600 w-full flex items-start gap-1 mt-1">
+                                      <div className="text-xs font-semibold text-rose-600 w-full flex items-start gap-1 p-2 bg-rose-50 border border-rose-100 rounded-lg">
                                         <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
                                         <span>{tallyError}</span>
                                       </div>
@@ -6590,7 +6753,7 @@ export default function App() {
                                   </div>
 
                                   {/* Actions based on connection */}
-                                  <div className="flex flex-wrap gap-2.5">
+                                  <div className="space-y-4">
                                     {tallyStatus !== 'Connected' ? (
                                       <button
                                         type="button"
@@ -6601,54 +6764,75 @@ export default function App() {
                                         {tallyStatus === 'Connecting' ? 'Connecting...' : 'Connect & Test'}
                                       </button>
                                     ) : (
-                                      <>
-                                        <button
-                                          type="button"
-                                          onClick={handleFetchMasters}
-                                          className="flex items-center gap-1.5 px-3.5 py-2 bg-zinc-900 hover:bg-zinc-800 text-white font-bold text-xs rounded-xl transition-colors"
-                                        >
-                                          <Database className="w-3.5 h-3.5" />
-                                          Fetch Masters
-                                        </button>
-                                        
-                                        <div className="flex items-center gap-2 border border-zinc-200 bg-white rounded-xl p-1.5">
-                                          <div className="flex items-center gap-1 text-[11px] text-zinc-500 font-medium">
+                                      <div className="space-y-3">
+                                        {/* Date Range Config for Daybook */}
+                                        <div className="flex flex-wrap items-center gap-4 border border-zinc-200 bg-white rounded-xl p-3 max-w-xl">
+                                          <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider shrink-0">Daybook Range:</span>
+                                          <div className="flex items-center gap-1.5 text-xs text-zinc-600 font-medium">
                                             <span>From:</span>
                                             <input 
                                               type="date" 
                                               value={tallyFromDate}
                                               onChange={(e) => setTallyFromDate(e.target.value)}
-                                              className="bg-zinc-50 border-0 text-zinc-800 text-xs px-1.5 py-0.5 rounded font-semibold focus:ring-0"
+                                              className="bg-zinc-50 border-0 text-zinc-800 text-xs px-2 py-1 rounded font-bold focus:ring-0"
                                             />
                                           </div>
-                                          <div className="flex items-center gap-1 text-[11px] text-zinc-500 font-medium border-l border-zinc-200 pl-2">
+                                          <div className="flex items-center gap-1.5 text-xs text-zinc-600 font-medium border-l border-zinc-200 pl-4">
                                             <span>To:</span>
                                             <input 
                                               type="date" 
                                               value={tallyToDate}
                                               onChange={(e) => setTallyToDate(e.target.value)}
-                                              className="bg-zinc-50 border-0 text-zinc-800 text-xs px-1.5 py-0.5 rounded font-semibold focus:ring-0"
+                                              className="bg-zinc-50 border-0 text-zinc-800 text-xs px-2 py-1 rounded font-bold focus:ring-0"
                                             />
                                           </div>
-                                          <button
-                                            type="button"
-                                            onClick={handleFetchDaybook}
-                                            className="flex items-center gap-1 px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] rounded-lg transition-colors"
-                                          >
-                                            <FileText className="w-3 h-3" />
-                                            Fetch Daybook
-                                          </button>
                                         </div>
 
-                                        <button
-                                          type="button"
-                                          onClick={handleDisconnect}
-                                          className="flex items-center gap-1.5 px-3.5 py-2 bg-zinc-100 hover:bg-zinc-200 text-zinc-700 font-bold text-xs rounded-xl transition-colors"
-                                        >
-                                          <X className="w-3.5 h-3.5" />
-                                          Disconnect
-                                        </button>
-                                      </>
+                                        {/* Action buttons list */}
+                                        <div className="flex flex-wrap gap-2">
+                                          <button
+                                            type="button"
+                                            onClick={() => handleTallyFetch('masters')}
+                                            disabled={isContextLoading}
+                                            className="flex items-center gap-1.5 px-3.5 py-2 bg-zinc-900 hover:bg-zinc-800 disabled:bg-zinc-700 text-white font-bold text-xs rounded-xl transition-colors"
+                                          >
+                                            {isContextLoading && lastFetchType === 'masters' ? (
+                                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                            ) : (
+                                              <Database className="w-3.5 h-3.5" />
+                                            )}
+                                            Fetch Masters
+                                          </button>
+
+                                          <button
+                                            type="button"
+                                            onClick={() => handleTallyFetch('daybook')}
+                                            disabled={isContextLoading}
+                                            className="flex items-center gap-1.5 px-3.5 py-2 bg-zinc-900 hover:bg-zinc-800 disabled:bg-zinc-700 text-white font-bold text-xs rounded-xl transition-colors"
+                                          >
+                                            {isContextLoading && lastFetchType === 'daybook' ? (
+                                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                            ) : (
+                                              <FileText className="w-3.5 h-3.5" />
+                                            )}
+                                            Fetch Daybook
+                                          </button>
+
+                                          <button
+                                            type="button"
+                                            onClick={() => handleTallyFetch('combined')}
+                                            disabled={isContextLoading}
+                                            className="flex items-center gap-1.5 px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-500 text-white font-bold text-xs rounded-xl transition-colors shadow-sm"
+                                          >
+                                            {isContextLoading && lastFetchType === 'combined' ? (
+                                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                            ) : (
+                                              <RefreshCw className="w-3.5 h-3.5" />
+                                            )}
+                                            Fetch Masters + Daybook
+                                          </button>
+                                        </div>
+                                      </div>
                                     )}
                                   </div>
 
@@ -6664,10 +6848,10 @@ export default function App() {
                                           type="button"
                                           onClick={() => {
                                             generateFetchReportExcel(
-                                              mastersSummary,
-                                              daybookSummary,
-                                              detailedParsedMasters,
-                                              detailedParsedTransactions
+                                              mastersSummary || undefined,
+                                              daybookSummary || undefined,
+                                              detailedParsedMasters || undefined,
+                                              detailedParsedTransactions || undefined
                                             );
                                           }}
                                           className="px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-[11px] font-bold transition-all flex items-center gap-1.5 self-start sm:self-center"
@@ -6675,6 +6859,16 @@ export default function App() {
                                           <Download className="w-3.5 h-3.5" />
                                           Download Fetch Report Excel
                                         </button>
+                                      </div>
+
+                                      <div className="space-y-1.5 text-xs text-zinc-600 font-semibold bg-zinc-50 rounded-xl p-3 border border-zinc-200/40 max-w-md">
+                                        <div className="flex justify-between"><span className="text-zinc-500">Selected Tally Company:</span> <span className="font-bold text-zinc-900">{selectedTallyCompany || 'N/A'}</span></div>
+                                        {lastFetchType && (
+                                          <div className="flex justify-between"><span className="text-zinc-500">Last Fetch Operation:</span> <span className="font-bold text-emerald-700 uppercase">{lastFetchType}</span></div>
+                                        )}
+                                        {daybookSummary && (
+                                          <div className="flex justify-between"><span className="text-zinc-500">Daybook Period:</span> <span className="font-bold text-zinc-900">{daybookSummary.fromDate} to {daybookSummary.toDate}</span></div>
+                                        )}
                                       </div>
 
                                       {/* Masters Fetch Summary */}
@@ -6707,7 +6901,7 @@ export default function App() {
                                           </div>
 
                                           {/* Masters Skip Reasons */}
-                                          {mastersSummary.failures.length > 0 && (
+                                          {mastersSummary.failures && mastersSummary.failures.length > 0 && (
                                             <div className="border border-rose-100 bg-rose-50/20 rounded-xl p-3 space-y-2">
                                               <p className="text-[11px] font-bold text-rose-800 flex items-center gap-1">
                                                 <AlertCircle className="w-3.5 h-3.5 text-rose-600" />
@@ -6755,7 +6949,7 @@ export default function App() {
                                           </div>
 
                                           {/* Daybook Failures Reasons */}
-                                          {daybookSummary.failures.length > 0 && (
+                                          {daybookSummary.failures && daybookSummary.failures.length > 0 && (
                                             <div className="border border-rose-100 bg-rose-50/20 rounded-xl p-3 space-y-2">
                                               <p className="text-[11px] font-bold text-rose-800 flex items-center gap-1">
                                                 <AlertCircle className="w-3.5 h-3.5 text-rose-600" />
@@ -6764,7 +6958,7 @@ export default function App() {
                                               <div className="max-h-24 overflow-y-auto space-y-1 font-mono text-[10px] text-rose-700 divide-y divide-rose-100/50">
                                                 {daybookSummary.failures.slice(0, 15).map((f, fIdx) => (
                                                   <div key={fIdx} className="py-1 flex justify-between gap-4">
-                                                    <span>{f.date} | No: <span className="font-bold">{f.voucherNo || 'N/A'}</span> ({f.type})</span>
+                                                    <span>{f.date} | No: <span className="font-bold">{f.voucherNo || 'N/A'}</span> ({f.voucherType})</span>
                                                     <span className="text-right italic shrink-0">{f.reason}</span>
                                                   </div>
                                                 ))}

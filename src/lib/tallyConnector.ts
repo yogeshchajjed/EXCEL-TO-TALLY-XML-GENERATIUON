@@ -1,6 +1,7 @@
 import { getAppMode } from './storageAdapter';
 import { ElectronTallyConfig, ElectronTallyResponse } from '../types/electron';
 import * as XLSX from 'xlsx';
+import { normalizeTallyDate } from './tallyXml';
 
 export interface LedgerMasterRow {
   rowNum: number;
@@ -210,8 +211,10 @@ export function buildExportUnitsRequest(): string {
  * XML builder to fetch Daybook Vouchers with date range
  */
 export function buildExportDaybookRequest(fromDate: string, toDate: string): string {
-  const fDate = fromDate.replace(/-/g, '');
-  const tDate = toDate.replace(/-/g, '');
+  const fDateObj = normalizeTallyDate(fromDate);
+  const fDate = fDateObj.isValid ? fDateObj.value : fromDate.replace(/[-/]/g, '');
+  const tDateObj = normalizeTallyDate(toDate);
+  const tDate = tDateObj.isValid ? tDateObj.value : toDate.replace(/[-/]/g, '');
   return `
 <ENVELOPE>
   <HEADER>
@@ -650,6 +653,9 @@ export interface DaybookFetchSummary {
   totalVouchers: number;
   fetchedVouchers: number;
   failedVouchers: number;
+  total: number;
+  fetched: number;
+  failed: number;
   failures: FetchTransactionFailure[];
 }
 
@@ -892,8 +898,10 @@ export function buildCompanyScopedExportRequest(
   } else {
     const fromDate = params?.fromDate || '';
     const toDate = params?.toDate || '';
-    const fDate = fromDate.replace(/-/g, '');
-    const tDate = toDate.replace(/-/g, '');
+    const fDateObj = normalizeTallyDate(fromDate);
+    const fDate = fDateObj.isValid ? fDateObj.value : fromDate.replace(/[-/]/g, '');
+    const tDateObj = normalizeTallyDate(toDate);
+    const tDate = tDateObj.isValid ? tDateObj.value : toDate.replace(/[-/]/g, '');
     return `
 <ENVELOPE>
   <HEADER>
@@ -1207,19 +1215,21 @@ export function parseDaybookWithSummary(
     const narration = node.getElementsByTagName("NARRATION")[0]?.textContent || "";
     const reference = node.getElementsByTagName("REFERENCE")[0]?.textContent || "";
     
-    if (!date || date.length !== 8) {
+    const normalizedResult = normalizeTallyDate(date);
+    if (!normalizedResult.isValid) {
       failures.push({
         date: date || 'N/A',
         voucherNo,
         voucherType: voucherType || 'N/A',
-        reason: 'Invalid date format (must be YYYYMMDD)'
+        reason: normalizedResult.error || 'Invalid date format (must be YYYYMMDD)'
       });
       continue;
     }
+    const finalDate = normalizedResult.value;
     
     if (!voucherType) {
       failures.push({
-        date,
+        date: finalDate,
         voucherNo,
         voucherType: 'N/A',
         reason: 'Missing voucher type'
@@ -1230,7 +1240,7 @@ export function parseDaybookWithSummary(
     const ledgerList = node.getElementsByTagName("ALLLEDGERENTRIES.LIST");
     if (ledgerList.length === 0) {
       failures.push({
-        date,
+        date: finalDate,
         voucherNo,
         voucherType,
         reason: 'Ledger entries missing'
@@ -1240,6 +1250,8 @@ export function parseDaybookWithSummary(
     
     let hasLedger = false;
     let hasZeroAmount = false;
+    const tempEntries: TallyDaybookTransaction[] = [];
+    
     for (let j = 0; j < ledgerList.length; j++) {
       const entry = ledgerList[j];
       const ledger = entry.getElementsByTagName("LEDGERNAME")[0]?.textContent || "";
@@ -1255,8 +1267,8 @@ export function parseDaybookWithSummary(
         hasZeroAmount = true;
       }
       
-      transactions.push({
-        date,
+      tempEntries.push({
+        date: finalDate,
         voucherType,
         narration,
         ledger,
@@ -1267,7 +1279,7 @@ export function parseDaybookWithSummary(
     
     if (!hasLedger) {
       failures.push({
-        date,
+        date: finalDate,
         voucherNo,
         voucherType,
         reason: 'Missing ledger names in entries'
@@ -1277,13 +1289,15 @@ export function parseDaybookWithSummary(
     
     if (hasZeroAmount) {
       failures.push({
-        date,
+        date: finalDate,
         voucherNo,
         voucherType,
-        reason: 'Zero amount entry found (warning)'
+        reason: 'Zero amount voucher ignored'
       });
+      continue;
     }
     
+    transactions.push(...tempEntries);
     fetchedVouchers++;
   }
   
@@ -1294,6 +1308,9 @@ export function parseDaybookWithSummary(
     totalVouchers,
     fetchedVouchers,
     failedVouchers: totalVouchers - fetchedVouchers,
+    total: totalVouchers,
+    fetched: fetchedVouchers,
+    failed: totalVouchers - fetchedVouchers,
     failures
   };
   
@@ -1398,10 +1415,15 @@ export function generateFetchReportExcel(
   const summaryWs = XLSX.utils.aoa_to_sheet(summaryRows);
   XLSX.utils.book_append_sheet(wb, summaryWs, 'Summary');
   
-  // Sheet 2: Fetched Masters
-  const fetchedMastersRows: any[] = [];
-  fetchedMastersRows.push(['Master Type', 'Master Name', 'Parent Group/Unit/Details']);
-  if (parsedMastersData) {
+  // Sheet 2: Fetched Masters (Dynamic)
+  if (parsedMastersData && (
+    (parsedMastersData.ledgers && parsedMastersData.ledgers.length > 0) ||
+    (parsedMastersData.groups && parsedMastersData.groups.length > 0) ||
+    (parsedMastersData.stockItems && parsedMastersData.stockItems.length > 0) ||
+    (parsedMastersData.units && parsedMastersData.units.length > 0)
+  )) {
+    const fetchedMastersRows: any[] = [];
+    fetchedMastersRows.push(['Master Type', 'Master Name', 'Parent Group/Unit/Details']);
     if (parsedMastersData.ledgers) {
       parsedMastersData.ledgers.forEach((l: string) => {
         const parent = parsedMastersData.ledgerGroupMap?.[l] || '';
@@ -1425,42 +1447,42 @@ export function generateFetchReportExcel(
         fetchedMastersRows.push(['Unit', u, '']);
       });
     }
+    const fetchedMastersWs = XLSX.utils.aoa_to_sheet(fetchedMastersRows);
+    XLSX.utils.book_append_sheet(wb, fetchedMastersWs, 'Fetched Masters');
   }
-  const fetchedMastersWs = XLSX.utils.aoa_to_sheet(fetchedMastersRows);
-  XLSX.utils.book_append_sheet(wb, fetchedMastersWs, 'Fetched Masters');
   
-  // Sheet 3: Failed Masters
-  const failedMastersRows: any[] = [];
-  failedMastersRows.push(['Master Type', 'Name', 'Reason for Failure / Skip']);
-  if (mastersSummary && mastersSummary.failures) {
+  // Sheet 3: Failed Masters (Dynamic)
+  if (mastersSummary && mastersSummary.failures && mastersSummary.failures.length > 0) {
+    const failedMastersRows: any[] = [];
+    failedMastersRows.push(['Master Type', 'Name', 'Reason for Failure / Skip']);
     mastersSummary.failures.forEach(f => {
       failedMastersRows.push([f.type, f.name, f.reason]);
     });
+    const failedMastersWs = XLSX.utils.aoa_to_sheet(failedMastersRows);
+    XLSX.utils.book_append_sheet(wb, failedMastersWs, 'Failed Masters');
   }
-  const failedMastersWs = XLSX.utils.aoa_to_sheet(failedMastersRows);
-  XLSX.utils.book_append_sheet(wb, failedMastersWs, 'Failed Masters');
   
-  // Sheet 4: Fetched Transactions
-  const fetchedTxRows: any[] = [];
-  fetchedTxRows.push(['Date', 'Voucher Type', 'Ledger Name', 'Amount', 'Narration', 'Reference']);
-  if (parsedTransactions) {
+  // Sheet 4: Fetched Transactions (Dynamic)
+  if (parsedTransactions && parsedTransactions.length > 0) {
+    const fetchedTxRows: any[] = [];
+    fetchedTxRows.push(['Date', 'Voucher Type', 'Ledger Name', 'Amount', 'Narration', 'Reference']);
     parsedTransactions.forEach(t => {
       fetchedTxRows.push([t.date, t.voucherType, t.ledger, t.amount, t.narration, t.reference]);
     });
+    const fetchedTxWs = XLSX.utils.aoa_to_sheet(fetchedTxRows);
+    XLSX.utils.book_append_sheet(wb, fetchedTxWs, 'Fetched Transactions');
   }
-  const fetchedTxWs = XLSX.utils.aoa_to_sheet(fetchedTxRows);
-  XLSX.utils.book_append_sheet(wb, fetchedTxWs, 'Fetched Transactions');
   
-  // Sheet 5: Failed Transactions
-  const failedTxRows: any[] = [];
-  failedTxRows.push(['Voucher Date', 'Voucher Number', 'Voucher Type', 'Reason for Failure / Skip']);
-  if (daybookSummary && daybookSummary.failures) {
+  // Sheet 5: Failed Transactions (Dynamic)
+  if (daybookSummary && daybookSummary.failures && daybookSummary.failures.length > 0) {
+    const failedTxRows: any[] = [];
+    failedTxRows.push(['Voucher Date', 'Voucher Number', 'Voucher Type', 'Reason for Failure / Skip']);
     daybookSummary.failures.forEach(f => {
       failedTxRows.push([f.date, f.voucherNo, f.voucherType, f.reason]);
     });
+    const failedTxWs = XLSX.utils.aoa_to_sheet(failedTxRows);
+    XLSX.utils.book_append_sheet(wb, failedTxWs, 'Failed Transactions');
   }
-  const failedTxWs = XLSX.utils.aoa_to_sheet(failedTxRows);
-  XLSX.utils.book_append_sheet(wb, failedTxWs, 'Failed Transactions');
   
   XLSX.writeFile(wb, `Tally_Fetch_Report_${Date.now()}.xlsx`);
 }
