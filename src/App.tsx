@@ -74,7 +74,8 @@ import {
   Trash2,
   RefreshCw,
   X,
-  Check
+  Check,
+  Activity
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import * as XLSX from 'xlsx';
@@ -111,6 +112,9 @@ import {
   generateMissingStockItemMastersXML,
   generateCombinedImportXML
 } from './lib/missingMasters';
+import { suggestLedgerForTransaction, HistoricalMapping } from './lib/ledgerSuggestion';
+import { SearchableCombobox } from './components/SearchableCombobox';
+import { generateDiagnosticReportExcel, extractTransactionsFromXmlObj } from './lib/tallyDiagnostic';
 
 // Set up PDF.js worker
 if (getAppMode() !== 'desktop-offline') {
@@ -138,7 +142,7 @@ interface TallyContext {
   units?: string[];
   ledgerGroupMap?: Record<string, string>; // Maps ledger name to its parent group
   stockItemStockGroupMap?: Record<string, string>; // Stock item to stock group mapping
-  historicalMappings?: { narration: string; ledger: string }[];
+  historicalMappings?: HistoricalMapping[];
   groupParentMap?: Record<string, string>; // Maps group name to parent group name
   ledgerDetails?: LedgerMasterRow[];
   stockItemDetails?: StockMasterRow[];
@@ -624,6 +628,8 @@ export default function App() {
   const [pendingData, setPendingData] = useState<any[]>([]);
   const [pendingFileName, setPendingFileName] = useState('');
   const [tallyContext, setTallyContext] = useState<TallyContext | null>(null);
+  const [manualContext, setManualContext] = useState<TallyContext | null>(null);
+  const [directContext, setDirectContext] = useState<TallyContext | null>(null);
   const [isContextLoading, setIsContextLoading] = useState(false);
   const [selectedVoucherType, setSelectedVoucherType] = useState('Payment');
   const [selectedBankLedger, setSelectedBankLedger] = useState('');
@@ -909,13 +915,13 @@ export default function App() {
       }
 
       // Historical mappings
-      let historicalMappings: { narration: string; ledger: string }[] = [];
+      let historicalMappings: HistoricalMapping[] = [];
       if (newDetailedTransactions && newDetailedTransactions.length > 0) {
         newDetailedTransactions.forEach((tx: any) => {
           if (tx.narration && tx.ledger) {
             const lLower = tx.ledger.toLowerCase();
             if (!lLower.includes('bank') && !lLower.includes('cash')) {
-              historicalMappings.push({ narration: tx.narration, ledger: tx.ledger });
+              historicalMappings.push({ narration: tx.narration, ledger: tx.ledger, source: 'Direct Tally Daybook' });
             }
           }
         });
@@ -964,12 +970,14 @@ export default function App() {
         historicalMappings: mergedHistorical,
         ledgerDetails: mergedLedgerDetails,
         stockItemDetails: mergedStockItemDetails,
+        transactions: newDetailedTransactions || [],
       };
 
       if (getAppMode() === 'web') {
         contextPayload.lastUpdated = serverTimestamp();
       }
       await saveTallyContext(user.uid, contextPayload);
+      setDirectContext(contextPayload);
       setIsContextLoading(false);
     } catch (err: any) {
       console.error("Failed to fetch Tally data", err);
@@ -3267,6 +3275,7 @@ export default function App() {
           contextPayload.lastUpdated = serverTimestamp();
         }
         await saveTallyContext(user.uid, contextPayload);
+        setManualContext(contextPayload);
 
         setIsContextLoading(false);
       } catch (err) {
@@ -3293,7 +3302,7 @@ export default function App() {
         const result = parser.parse(xml);
         
         const ledgerNamesFromEntries: string[] = [];
-        const historicalMappings: { narration: string; ledger: string }[] = [];
+        const historicalMappings: HistoricalMapping[] = [];
 
         const traverseForVouchers = (obj: any) => {
           if (!obj) return;
@@ -3314,7 +3323,7 @@ export default function App() {
                 if (narration) {
                   const primaryEntry = entries.find((e: any) => e.LEDGERNAME && !e.LEDGERNAME.toLowerCase().includes('bank') && !e.LEDGERNAME.toLowerCase().includes('cash'));
                   if (primaryEntry) {
-                    historicalMappings.push({ narration: String(narration), ledger: String(primaryEntry.LEDGERNAME) });
+                    historicalMappings.push({ narration: String(narration), ledger: String(primaryEntry.LEDGERNAME), source: 'Uploaded Transaction XML' });
                   }
                 }
               }
@@ -3329,6 +3338,8 @@ export default function App() {
         };
 
         traverseForVouchers(result);
+
+        const { transactions: parsedTxs, parseErrors: parsedErrs } = extractTransactionsFromXmlObj(result);
 
         const currentLedgers = tallyContext?.ledgers || [];
         const mergedLedgers = Array.from(new Set([...currentLedgers, ...ledgerNamesFromEntries]));
@@ -3357,11 +3368,14 @@ export default function App() {
           historicalMappings: mergedHistorical,
           ledgerDetails: tallyContext?.ledgerDetails || [],
           stockItemDetails: tallyContext?.stockItemDetails || [],
+          transactions: parsedTxs,
+          parseErrors: parsedErrs
         };
         if (getAppMode() === 'web') {
           contextPayload.lastUpdated = serverTimestamp();
         }
         await saveTallyContext(user.uid, contextPayload);
+        setManualContext(contextPayload);
 
         setIsContextLoading(false);
       } catch (err) {
@@ -3389,7 +3403,9 @@ export default function App() {
     const ledgerGroupMap: Record<string, string> = {};
     const stockItemStockGroupMap: Record<string, string> = {};
     const groupParentMap: Record<string, string> = {};
-    const historicalMappings: { narration: string; ledger: string }[] = [];
+    const historicalMappings: HistoricalMapping[] = [];
+    const allCombinedTxs: any[] = [];
+    const allCombinedErrs: string[] = [];
 
     const processFile = (file: File): Promise<void> => {
       return new Promise((resolve) => {
@@ -3413,6 +3429,11 @@ export default function App() {
               Object.assign(groupParentMap, parsed.groupParentMap);
             }
 
+            // Extract transactions
+            const { transactions: parsedTxs, parseErrors: parsedErrs } = extractTransactionsFromXmlObj(result);
+            allCombinedTxs.push(...parsedTxs);
+            allCombinedErrs.push(...parsedErrs);
+
             // Recursively extract Vouchers
             const traverseVouchers = (obj: any) => {
               if (!obj) return;
@@ -3431,7 +3452,7 @@ export default function App() {
                     if (narration) {
                       const primaryEntry = entries.find((e: any) => e.LEDGERNAME && !e.LEDGERNAME.toLowerCase().includes('bank') && !e.LEDGERNAME.toLowerCase().includes('cash'));
                       if (primaryEntry) {
-                        historicalMappings.push({ narration: String(narration), ledger: String(primaryEntry.LEDGERNAME) });
+                        historicalMappings.push({ narration: String(narration), ledger: String(primaryEntry.LEDGERNAME), source: 'Uploaded Transaction XML' });
                       }
                     }
                   }
@@ -3470,11 +3491,14 @@ export default function App() {
       historicalMappings: historicalMappings.slice(0, 500),
       ledgerDetails: tallyContext?.ledgerDetails || [],
       stockItemDetails: tallyContext?.stockItemDetails || [],
+      transactions: allCombinedTxs,
+      parseErrors: allCombinedErrs
     };
     if (getAppMode() === 'web') {
       contextPayload.lastUpdated = serverTimestamp();
     }
     await saveTallyContext(user.uid, contextPayload);
+    setManualContext(contextPayload);
 
     setIsContextLoading(false);
   };
@@ -3503,111 +3527,26 @@ export default function App() {
   // --- Local Deterministic Bank Statement Helpers ---
   const suggestLedgerForNarrationEnhanced = (
     narration: string,
-    context: TallyContext | null
-  ): { ledgerName: string; confidence: number; reasoning: string } => {
-    if (!context || !narration) {
-      return { ledgerName: '', confidence: 0, reasoning: 'No narration or context' };
+    context: TallyContext | null,
+    reference: string = '',
+    amount: number = 0
+  ): { ledgerName: string; confidence: number; reasoning: string; source?: string } => {
+    if (!context) {
+      return { ledgerName: '', confidence: 0, reasoning: 'No context loaded', source: 'Keyword/Fuzzy' };
     }
-
-    const cleanNarr = narration.toLowerCase().trim();
-    const normNarr = cleanNarr.replace(/[^a-z0-9]/g, '');
-
-    const isValidLedger = (name: string) => context.ledgers.includes(name);
-
-    let candidateLedger = '';
-    let candidateConfidence = 0;
-    let candidateReasoning = 'No match found.';
-
-    // 1. Exact historical mapping from Daybook
-    if (context.historicalMappings) {
-      const exactHist = context.historicalMappings.find(h => h.narration.toLowerCase().trim() === cleanNarr);
-      if (exactHist && isValidLedger(exactHist.ledger)) {
-        candidateLedger = exactHist.ledger;
-        candidateConfidence = 1.0;
-        candidateReasoning = 'Matched exact historical narration from Daybook';
-      }
-    }
-
-    // 2. Normalized historical match
-    if (!candidateLedger && context.historicalMappings) {
-      const normHist = context.historicalMappings.find(h => h.narration.toLowerCase().replace(/[^a-z0-9]/g, '') === normNarr);
-      if (normHist && isValidLedger(normHist.ledger)) {
-        candidateLedger = normHist.ledger;
-        candidateConfidence = 0.95;
-        candidateReasoning = 'Matched normalized historical narration';
-      }
-    }
-
-    // 3. Keyword match (exact ledger name in narration)
-    if (!candidateLedger) {
-      const sortedLedgers = [...context.ledgers].sort((a, b) => b.length - a.length);
-      for (const ledger of sortedLedgers) {
-        const ledgerLower = ledger.toLowerCase().trim();
-        if (ledgerLower.length > 3 && cleanNarr.includes(ledgerLower)) {
-          candidateLedger = ledger;
-          candidateConfidence = 0.90;
-          candidateReasoning = `Found exact ledger name "${ledger}" in narration`;
-          break;
-        }
-      }
-    }
-
-    // 4. Fuzzy match (getSimilarity score >= 0.8)
-    if (!candidateLedger && context.historicalMappings) {
-      let bestMatch: { ledger: string; score: number } | null = null;
-      for (const h of context.historicalMappings) {
-        const score = getSimilarity(h.narration, narration);
-        if (score >= 0.8) {
-          if (!bestMatch || score > bestMatch.score) {
-            bestMatch = { ledger: h.ledger, score };
-          }
-        }
-      }
-      if (bestMatch && isValidLedger(bestMatch.ledger)) {
-        candidateLedger = bestMatch.ledger;
-        candidateConfidence = Math.round(bestMatch.score * 100) / 100;
-        candidateReasoning = `Fuzzy matched historical narration with ${(bestMatch.score * 100).toFixed(0)}% similarity`;
-      }
-    }
-
-    // 5. Ledger name words found inside narration
-    if (!candidateLedger) {
-      const sortedLedgers = [...context.ledgers].sort((a, b) => b.length - a.length);
-      for (const ledger of sortedLedgers) {
-        const ledgerWords = ledger.toLowerCase().split(/[^a-zA-Z0-9]/).filter(w => w.length > 3);
-        if (ledgerWords.length > 0 && ledgerWords.every(w => cleanNarr.includes(w))) {
-          candidateLedger = ledger;
-          candidateConfidence = 0.75;
-          candidateReasoning = `All descriptive words of "${ledger}" found in narration`;
-          break;
-        }
-      }
-    }
-
-    const suspenseLedger = context.ledgers.find(l => /^suspense$/i.test(l) || /^suspense account$/i.test(l));
-
-    // Rule: Where system is less than 90% sure about ledger name, select Suspense Account (if available).
-    if (candidateLedger && candidateConfidence >= 0.90) {
-      return {
-        ledgerName: candidateLedger,
-        confidence: candidateConfidence,
-        reasoning: candidateReasoning
-      };
-    } else {
-      if (suspenseLedger) {
-        return {
-          ledgerName: suspenseLedger,
-          confidence: candidateLedger ? candidateConfidence : 0,
-          reasoning: "Low confidence. Suspense selected. Please review."
-        };
-      } else {
-        return {
-          ledgerName: '',
-          confidence: candidateLedger ? candidateConfidence : 0,
-          reasoning: "Low confidence. Please review. (Needs Review)"
-        };
-      }
-    }
+    const result = suggestLedgerForTransaction(
+      narration,
+      reference,
+      amount,
+      context.ledgers || [],
+      context.historicalMappings || []
+    );
+    return {
+      ledgerName: result.ledgerName,
+      confidence: result.confidence,
+      reasoning: result.reasoning,
+      source: result.source
+    };
   };
 
   const suggestLedgerForNarration = (narration: string, context: TallyContext | null): string => {
@@ -4346,6 +4285,7 @@ export default function App() {
           detectedVoucherType,
           suggestedLedger: suggestion.ledgerName,
           confidence: Math.round(suggestion.confidence * 100),
+          suggestionSource: suggestion.source || 'Keyword/Fuzzy',
           userLedger: suggestion.ledgerName,
           reference,
           status: rowStatus,
@@ -4422,7 +4362,7 @@ export default function App() {
             type: 'list',
             allowBlank: true,
             formulae: [excelFormula],
-            showErrorMessage: true,
+            showErrorMessage: false,
             errorTitle: 'Invalid Ledger',
             error: 'Please select a valid ledger from Tally Masters.'
           };
@@ -6844,21 +6784,33 @@ export default function App() {
                                           <CheckCircle2 className="w-4 h-4 text-emerald-600" />
                                           Data Fetch & Import Report
                                         </h4>
-                                        <button
-                                          type="button"
-                                          onClick={() => {
-                                            generateFetchReportExcel(
-                                              mastersSummary || undefined,
-                                              daybookSummary || undefined,
-                                              detailedParsedMasters || undefined,
-                                              detailedParsedTransactions || undefined
-                                            );
-                                          }}
-                                          className="px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-[11px] font-bold transition-all flex items-center gap-1.5 self-start sm:self-center"
-                                        >
-                                          <Download className="w-3.5 h-3.5" />
-                                          Download Fetch Report Excel
-                                        </button>
+                                        <div className="flex flex-wrap items-center gap-2 self-start sm:self-center">
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              generateFetchReportExcel(
+                                                mastersSummary || undefined,
+                                                daybookSummary || undefined,
+                                                detailedParsedMasters || undefined,
+                                                detailedParsedTransactions || undefined
+                                              );
+                                            }}
+                                            className="px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-[11px] font-bold transition-all flex items-center gap-1.5"
+                                          >
+                                            <Download className="w-3.5 h-3.5" />
+                                            Download Fetch Report Excel
+                                          </button>
+
+                                          <button
+                                            type="button"
+                                            onClick={() => generateDiagnosticReportExcel(manualContext, directContext || tallyContext)}
+                                            className="px-3 py-1.5 bg-zinc-900 hover:bg-zinc-800 text-white rounded-lg text-[11px] font-bold transition-all flex items-center gap-1.5 shadow-sm"
+                                            title="Compare Manual XML upload with Direct Tally Connection counts & groupings side-by-side"
+                                          >
+                                            <Activity className="w-3.5 h-3.5 text-zinc-300" />
+                                            Direct vs Manual Diagnostics
+                                          </button>
+                                        </div>
                                       </div>
 
                                       <div className="space-y-1.5 text-xs text-zinc-600 font-semibold bg-zinc-50 rounded-xl p-3 border border-zinc-200/40 max-w-md">
@@ -8022,27 +7974,14 @@ export default function App() {
                         <Building className="w-5 h-5" />
                       </div>
                       <div>
-                        <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">Active Bank / Cash Ledger</p>
-                        {tallyContext ? (
-                          <select
-                            value={selectedBankLedger}
-                            onChange={(e) => setSelectedBankLedger(e.target.value)}
-                            className="bg-transparent text-sm font-bold text-zinc-800 focus:outline-none border-b border-dashed border-zinc-400 pb-0.5 cursor-pointer mt-0.5"
-                          >
-                            <option value="">-- Select Bank/Cash Ledger --</option>
-                            {tallyContext.ledgers.map(l => (
-                              <option key={l} value={l}>{l}</option>
-                            ))}
-                          </select>
-                        ) : (
-                          <input
-                            type="text"
-                            value={selectedBankLedger}
-                            onChange={(e) => setSelectedBankLedger(e.target.value)}
-                            placeholder="Type Bank/Cash Ledger name"
-                            className="bg-transparent text-sm font-bold text-zinc-800 focus:outline-none border-b border-dashed border-zinc-400 pb-0.5 placeholder-zinc-400 w-64 mt-0.5"
-                          />
-                        )}
+                        <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-1">Active Bank / Cash Ledger</p>
+                        <SearchableCombobox
+                          value={selectedBankLedger}
+                          onChange={(val) => setSelectedBankLedger(val)}
+                          options={tallyContext?.ledgers || []}
+                          placeholder="Type or select Bank/Cash Ledger..."
+                          className="w-64"
+                        />
                       </div>
                     </div>
                     
@@ -8241,7 +8180,7 @@ export default function App() {
                       }
 
                       return (
-                        <table className="w-full text-[11px] text-left border-collapse table-fixed min-w-[1400px]">
+                        <table className="w-full text-[11px] text-left border-collapse table-fixed min-w-[1600px]">
                           <thead className="bg-zinc-50 text-zinc-600 uppercase font-bold border-b border-zinc-200 sticky top-0 z-10">
                             <tr>
                               <th className="p-3 w-16 text-center">Include</th>
@@ -8253,11 +8192,13 @@ export default function App() {
                               <th className="p-3 w-28 text-right">Credit</th>
                               <th className="p-3 w-28 text-right">Amount</th>
                               <th className="p-3 w-28">Reference</th>
-                              <th className="p-3 w-40">Suggested Ledger</th>
-                              <th className="p-3 w-20 text-center">Conf %</th>
-                              <th className="p-3 w-56">Final Ledger Account</th>
-                              <th className="p-3 w-32">Master Status</th>
-                              <th className="p-3 w-48">Warning / Error</th>
+                              <th className="p-3 w-36">Suggested Ledger</th>
+                              <th className="p-3 w-16 text-center">Conf %</th>
+                              <th className="p-3 w-36">Suggestion Source</th>
+                              <th className="p-3 w-48">Reason</th>
+                              <th className="p-3 w-48">Final Ledger Account</th>
+                              <th className="p-3 w-28">Master Status</th>
+                              <th className="p-3 w-36">Warning / Error</th>
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-zinc-100">
@@ -8389,14 +8330,25 @@ export default function App() {
                                     </span>
                                   </td>
 
+                                  {/* Suggestion Source */}
+                                  <td className={`${paddingClass} font-medium text-zinc-600 truncate`} title={row.userLedger !== row.suggestedLedger ? 'User Correction' : row.suggestionSource}>
+                                    {row.userLedger !== row.suggestedLedger ? (
+                                      <span className="text-blue-600 font-semibold">User Correction</span>
+                                    ) : (
+                                      row.suggestionSource || 'Keyword/Fuzzy'
+                                    )}
+                                  </td>
+
+                                  {/* Reason */}
+                                  <td className={`${paddingClass} text-zinc-500 truncate`} title={row.userLedger !== row.suggestedLedger ? 'Manually corrected by user' : row.reasoning}>
+                                    {row.userLedger !== row.suggestedLedger ? 'Manually corrected by user' : (row.reasoning || 'Default fallback')}
+                                  </td>
+
                                   {/* Final Ledger Account Search/Editable Input */}
                                   <td className={`${paddingClass}`}>
-                                    <input
-                                      type="text"
-                                      list="tally-ledgers-list"
+                                    <SearchableCombobox
                                       value={row.userLedger || ''}
-                                      onChange={(e) => {
-                                        const val = e.target.value;
+                                      onChange={(val) => {
                                         const updated = [...bankStatementRows];
                                         const origIdx = bankStatementRows.findIndex(r => r.rowNo === row.rowNo);
                                         if (origIdx !== -1) {
@@ -8405,8 +8357,8 @@ export default function App() {
                                         }
                                       }}
                                       disabled={isExcluded}
-                                      placeholder="Type or select ledger"
-                                      className="w-full p-2 bg-white border border-zinc-200 rounded-lg text-xs outline-none focus:ring-1 focus:ring-zinc-950 disabled:opacity-50 font-semibold text-zinc-800"
+                                      options={tallyContext?.ledgers || []}
+                                      placeholder="Type or select ledger..."
                                     />
                                   </td>
 

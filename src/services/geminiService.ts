@@ -1,4 +1,5 @@
 import { GoogleGenAI, Type, ThinkingLevel } from "@google/genai";
+import { suggestLedgerForTransaction, HistoricalMapping } from "../lib/ledgerSuggestion";
 
 let aiInstance: any = null;
 
@@ -150,6 +151,7 @@ export interface MappedTransaction extends BankTransaction {
   tallyLedger: string;
   confidence: number;
   reasoning: string;
+  suggestionSource?: string;
 }
 
 export async function parseBankStatementText(text: string): Promise<BankTransaction[]> {
@@ -192,80 +194,35 @@ export async function parseBankStatementText(text: string): Promise<BankTransact
 export async function mapBankTransactions(
   transactions: BankTransaction[],
   tallyLedgers: string[],
-  historicalMappings?: { narration: string; ledger: string }[]
+  historicalMappings?: HistoricalMapping[]
 ): Promise<MappedTransaction[]> {
-  const hasSuspense = tallyLedgers.includes('Suspense Account');
-
-  // We should process transactions and apply the Rules!
-  // Rule I: If Particulars / Ledger field is already filled in standard template, preserve it!
   const results = transactions.map(tx => {
+    // Rule I: If Particulars / Ledger field is already filled in standard template, preserve it!
     if (tx.particulars && tx.particulars.trim() !== '') {
       return {
         ...tx,
         tallyLedger: tx.particulars.trim(),
         confidence: 1.0,
-        reasoning: 'Preserved user-provided ledger from Excel file.'
+        reasoning: 'Preserved user-provided ledger from Excel file.',
+        suggestionSource: 'User Correction'
       };
     }
 
-    // Otherwise, try to suggest ledger using local deterministic keyword / historical mappings logic!
-    const cleanNarr = tx.description.toLowerCase().trim();
-    let matchedLedger = '';
-    let confidence = 0;
-    let reasoning = '';
+    const suggestion = suggestLedgerForTransaction(
+      tx.description,
+      tx.reference || '',
+      tx.amount || 0,
+      tallyLedgers,
+      historicalMappings || []
+    );
 
-    // 1. Exact historical
-    if (historicalMappings) {
-      const exact = historicalMappings.find(h => h.narration.toLowerCase().trim() === cleanNarr);
-      if (exact && tallyLedgers.includes(exact.ledger)) {
-        matchedLedger = exact.ledger;
-        confidence = 1.0;
-        reasoning = 'Matched exact historical narration from Daybook';
-      }
-    }
-
-    // 2. Keyword match
-    if (!matchedLedger) {
-      for (const ledger of tallyLedgers) {
-        const ledgerLower = ledger.toLowerCase().trim();
-        if (cleanNarr.includes(ledgerLower) && ledgerLower.length > 3) {
-          matchedLedger = ledger;
-          confidence = 0.90;
-          reasoning = `Found exact ledger name "${ledger}" in narration`;
-          break;
-        }
-      }
-    }
-
-    // If confidence is high (>= 90%), keep it. Otherwise, use Suspense fallback!
-    if (matchedLedger && confidence >= 0.90) {
-      return {
-        ...tx,
-        tallyLedger: matchedLedger,
-        confidence,
-        reasoning
-      } as MappedTransaction;
-    } else {
-      if (hasSuspense) {
-        return {
-          ...tx,
-          tallyLedger: 'Suspense Account',
-          confidence: matchedLedger ? confidence : 0,
-          reasoning: matchedLedger
-            ? `Match found ("${matchedLedger}" with ${(confidence*100).toFixed(0)}% confidence) is below 90% threshold. Fallback to Suspense.`
-            : 'No reliable local match. Fallback to Suspense.'
-        } as MappedTransaction;
-      } else {
-        return {
-          ...tx,
-          tallyLedger: '',
-          confidence: matchedLedger ? confidence : 0,
-          reasoning: matchedLedger
-            ? `Match found ("${matchedLedger}" with ${(confidence*100).toFixed(0)}% confidence) is below 90% threshold. "Suspense Account" not found.`
-            : 'No reliable local match. "Suspense Account" not found.'
-        } as MappedTransaction;
-      }
-    }
+    return {
+      ...tx,
+      tallyLedger: suggestion.ledgerName,
+      confidence: suggestion.confidence,
+      reasoning: suggestion.reasoning,
+      suggestionSource: suggestion.source
+    };
   });
 
   return results;

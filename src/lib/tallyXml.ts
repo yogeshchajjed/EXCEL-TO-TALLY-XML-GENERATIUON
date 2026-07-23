@@ -85,6 +85,17 @@ export function normalizeTallyDate(input: any): { isValid: boolean; value: strin
       return { isValid: false, value: '', error: 'Date is empty.' };
     }
 
+    // Check if string is a numeric representation of an Excel serial date
+    if (/^\d{5}$/.test(str)) {
+      const num = parseInt(str);
+      if (num > 0 && num < 100000) {
+        const date = new Date((num - 25569) * 86400 * 1000);
+        if (!isNaN(date.getTime())) {
+          return { isValid: true, value: validateAndFormatDateParts(date.getFullYear(), date.getMonth() + 1, date.getDate()) };
+        }
+      }
+    }
+
     const monthsMap: Record<string, number> = {
       jan: 1, january: 1,
       feb: 2, february: 2,
@@ -270,15 +281,22 @@ export function generateTallyXML(vouchers: TallyVoucher[], useLedgerAsNarr: bool
                 }
               }
 
+              const normDate = normalizeTallyDate(v.date);
+              if (!normDate.isValid) {
+                const identifier = v.voucherNumber ? `Voucher No: ${v.voucherNumber}` : `Voucher type: ${v.voucherType}`;
+                throw new Error(`Invalid Date error in voucher entry (${identifier}). Got value: "${v.date}". Error details: ${normDate.error || 'Check date format (DD/MM/YYYY or YYYY-MM-DD)'}`);
+              }
+              const formattedDate = normDate.value;
+
               return {
                 VOUCHER: {
                   '@_VCHTYPE': v.voucherType,
                   '@_ACTION': 'Create',
                   '@_OBJVIEW': 'Accounting Voucher View',
-                  DATE: v.date.replace(/-/g, ''),
-                  REFERENCEDATE: v.date.replace(/-/g, ''),
-                  VCHSTATUSDATE: v.date.replace(/-/g, ''),
-                  EFFECTIVEDATE: v.date.replace(/-/g, ''),
+                  DATE: formattedDate,
+                  REFERENCEDATE: formattedDate,
+                  VCHSTATUSDATE: formattedDate,
+                  EFFECTIVEDATE: formattedDate,
                   VOUCHERTYPENAME: v.voucherType,
                   VCHSTATUSVOUCHERTYPE: v.voucherType,
                   VOUCHERTYPEORIGNAME: v.voucherType,

@@ -363,7 +363,7 @@ export function parseTallyLedgersXml(xml: string): LedgerMasterRow[] {
     const ledgerName = node.getAttribute("NAME") || node.getElementsByTagName("NAME")[0]?.textContent || "";
     if (!ledgerName) continue;
     
-    const underGroup = node.getElementsByTagName("PARENT")[0]?.textContent || "Primary";
+    const underGroup = node.getElementsByTagName("PARENT")[0]?.textContent || "Sundry Debtors";
     const openingBalance = node.getElementsByTagName("OPENINGBALANCE")[0]?.textContent || "";
     const mailingName = node.getElementsByTagName("MAILINGNAME")[0]?.textContent || ledgerName;
     
@@ -371,12 +371,12 @@ export function parseTallyLedgersXml(xml: string): LedgerMasterRow[] {
     const address1 = addressNodes[0]?.textContent || "";
     const address2 = addressNodes[1]?.textContent || "";
     
-    const state = node.getElementsByTagName("LEDSTATENAME")[0]?.textContent || "";
+    const state = node.getElementsByTagName("LEDSTATENAME")[0]?.textContent || node.getElementsByTagName("STATENAME")[0]?.textContent || node.getElementsByTagName("STATE")[0]?.textContent || "";
     const country = node.getElementsByTagName("COUNTRYNAME")[0]?.textContent || "India";
     const pincode = node.getElementsByTagName("PINCODE")[0]?.textContent || "";
     const pan = node.getElementsByTagName("INCOMETAXNUMBER")[0]?.textContent || "";
-    const gstin = node.getElementsByTagName("PARTYGSTIN")[0]?.textContent || "";
-    const registrationType = node.getElementsByTagName("GSTREGISTRATIONTYPE")[0]?.textContent || "";
+    const gstin = node.getElementsByTagName("PARTYGSTIN")[0]?.textContent || node.getElementsByTagName("GSTIN")[0]?.textContent || "";
+    const registrationType = node.getElementsByTagName("GSTREGISTRATIONTYPE")[0]?.textContent || node.getElementsByTagName("REGISTRATIONTYPE")[0]?.textContent || "";
     const email = node.getElementsByTagName("EMAIL")[0]?.textContent || "";
     
     ledgers.push({
@@ -516,9 +516,18 @@ export function parseTallyDaybookXml(xml: string): TallyDaybookTransaction[] {
     const narration = node.getElementsByTagName("NARRATION")[0]?.textContent || "";
     const reference = node.getElementsByTagName("REFERENCE")[0]?.textContent || "";
     
-    const ledgerList = node.getElementsByTagName("ALLLEDGERENTRIES.LIST");
-    for (let j = 0; j < ledgerList.length; j++) {
-      const entry = ledgerList[j];
+    const entries: Element[] = [];
+    const allLedgerEls = node.getElementsByTagName("ALLLEDGERENTRIES.LIST");
+    for (let j = 0; j < allLedgerEls.length; j++) {
+      entries.push(allLedgerEls[j]);
+    }
+    const ledgerEls = node.getElementsByTagName("LEDGERENTRIES.LIST");
+    for (let j = 0; j < ledgerEls.length; j++) {
+      entries.push(ledgerEls[j]);
+    }
+    
+    for (let j = 0; j < entries.length; j++) {
+      const entry = entries[j];
       const ledger = entry.getElementsByTagName("LEDGERNAME")[0]?.textContent || "";
       const amountStr = entry.getElementsByTagName("AMOUNT")[0]?.textContent || "0";
       const amount = parseFloat(amountStr);
@@ -991,11 +1000,7 @@ export function parseMastersWithSummary(
       failures.push({ type: 'Ledger', name: `Ledger #${i+1}`, reason: 'Missing name' });
       continue;
     }
-    const underGroup = node.getElementsByTagName("PARENT")[0]?.textContent || "";
-    if (!underGroup) {
-      failures.push({ type: 'Ledger', name, reason: 'Parent group missing' });
-      continue;
-    }
+    const underGroup = node.getElementsByTagName("PARENT")[0]?.textContent || "Sundry Debtors";
     if (ledgerNames.includes(name)) {
       failures.push({ type: 'Ledger', name, reason: 'Duplicate master ignored' });
       continue;
@@ -1004,8 +1009,8 @@ export function parseMastersWithSummary(
     ledgerNames.push(name);
     ledgerGroupMap[name] = underGroup;
     
-    const gstin = node.getElementsByTagName("PARTYGSTIN")[0]?.textContent || "";
-    const regType = node.getElementsByTagName("GSTREGISTRATIONTYPE")[0]?.textContent || "";
+    const gstin = node.getElementsByTagName("PARTYGSTIN")[0]?.textContent || node.getElementsByTagName("GSTIN")[0]?.textContent || "";
+    const regType = node.getElementsByTagName("GSTREGISTRATIONTYPE")[0]?.textContent || node.getElementsByTagName("REGISTRATIONTYPE")[0]?.textContent || "";
     if (regType && regType !== 'Unregistered' && gstin && gstin.length !== 15) {
       failures.push({ type: 'Ledger', name, reason: 'Invalid GSTIN length (warning)' });
     }
@@ -1015,7 +1020,7 @@ export function parseMastersWithSummary(
     const addressNodes = node.getElementsByTagName("ADDRESS");
     const address1 = addressNodes[0]?.textContent || "";
     const address2 = addressNodes[1]?.textContent || "";
-    const state = node.getElementsByTagName("LEDSTATENAME")[0]?.textContent || "";
+    const state = node.getElementsByTagName("LEDSTATENAME")[0]?.textContent || node.getElementsByTagName("STATENAME")[0]?.textContent || node.getElementsByTagName("STATE")[0]?.textContent || "";
     const country = node.getElementsByTagName("COUNTRYNAME")[0]?.textContent || "India";
     const pincode = node.getElementsByTagName("PINCODE")[0]?.textContent || "";
     const pan = node.getElementsByTagName("INCOMETAXNUMBER")[0]?.textContent || "";
@@ -1064,11 +1069,7 @@ export function parseMastersWithSummary(
       continue;
     }
     const underGroup = node.getElementsByTagName("PARENT")[0]?.textContent || "Primary";
-    const unit = node.getElementsByTagName("BASEUNITS")[0]?.textContent || "";
-    if (!unit) {
-      failures.push({ type: 'StockItem', name, reason: 'Invalid stock unit / missing unit mapping' });
-      continue;
-    }
+    const unit = node.getElementsByTagName("BASEUNITS")[0]?.textContent || node.getElementsByTagName("UNIT")[0]?.textContent || "NOS";
     if (stockItemNames.includes(name)) {
       failures.push({ type: 'StockItem', name, reason: 'Duplicate master ignored' });
       continue;
@@ -1237,8 +1238,17 @@ export function parseDaybookWithSummary(
       continue;
     }
     
-    const ledgerList = node.getElementsByTagName("ALLLEDGERENTRIES.LIST");
-    if (ledgerList.length === 0) {
+    const entries: Element[] = [];
+    const allLedgerEls = node.getElementsByTagName("ALLLEDGERENTRIES.LIST");
+    for (let j = 0; j < allLedgerEls.length; j++) {
+      entries.push(allLedgerEls[j]);
+    }
+    const ledgerEls = node.getElementsByTagName("LEDGERENTRIES.LIST");
+    for (let j = 0; j < ledgerEls.length; j++) {
+      entries.push(ledgerEls[j]);
+    }
+
+    if (entries.length === 0) {
       failures.push({
         date: finalDate,
         voucherNo,
@@ -1252,8 +1262,8 @@ export function parseDaybookWithSummary(
     let hasZeroAmount = false;
     const tempEntries: TallyDaybookTransaction[] = [];
     
-    for (let j = 0; j < ledgerList.length; j++) {
-      const entry = ledgerList[j];
+    for (let j = 0; j < entries.length; j++) {
+      const entry = entries[j];
       const ledger = entry.getElementsByTagName("LEDGERNAME")[0]?.textContent || "";
       const amountStr = entry.getElementsByTagName("AMOUNT")[0]?.textContent || "0";
       const amount = parseFloat(amountStr);
